@@ -151,6 +151,12 @@ struct StatesGroup
     Matrix<double, DIM_STATE, DIM_STATE>  cov;     // states covariance
 };
 
+struct PoseInfo {
+    double time;
+    double x, y, z;
+    double qw, qx, qy, qz;
+};
+
 template<typename T>
 T rad2deg(T radians)
 {

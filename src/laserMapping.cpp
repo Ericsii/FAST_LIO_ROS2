@@ -55,13 +55,17 @@
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
-#include <std_srvs/srv/trigger.hpp>
+#include "std_srvs/srv/trigger.hpp"
+#include "fast_lio/srv/load_map.hpp"
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <pcl/registration/icp.h>
+#include <iomanip>
+#include <sstream>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -142,6 +146,19 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+bool relocalization_mode; 
+bool periodic_save;
+double save_interval;
+std::vector<double> initial_pose;
+std::vector<PoseInfo> path_record;
+
+rclcpp::TimerBase::SharedPtr map_save_timer_;
+rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_service_;
+rclcpp::Service<fast_lio::srv::LoadMap>::SharedPtr load_map_service_;
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubGlobalMap_;
+rclcpp::TimerBase::SharedPtr global_map_timer_;
 
 void SigHandle(int sig)
 {
@@ -450,26 +467,19 @@ void map_incremental()
         {
             const PointVector &points_near = Nearest_Points[i];
             bool need_add = true;
-            BoxPointType Box_of_Point;
-            PointType downsample_result, mid_point; 
-            mid_point.x = floor(feats_down_world->points[i].x/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            mid_point.y = floor(feats_down_world->points[i].y/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            mid_point.z = floor(feats_down_world->points[i].z/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            float dist  = calc_dist(feats_down_world->points[i],mid_point);
-            if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min && fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min && fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min){
-                PointNoNeedDownsample.push_back(feats_down_world->points[i]);
-                continue;
-            }
-            for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i ++)
-            {
-                if (points_near.size() < NUM_MATCH_POINTS) break;
-                if (calc_dist(points_near[readd_i], mid_point) < dist)
-                {
+            
+            // Relax the condition for filtering points
+            if (points_near.size() >= 5) {
+                // Check the distance to the nearest point
+                float dist = calc_dist(feats_down_world->points[i], points_near[0]);
+                if (dist < 0.05) {  // Reduce from 0.1 to 0.05
                     need_add = false;
-                    break;
                 }
             }
-            if (need_add) PointToAdd.push_back(feats_down_world->points[i]);
+            
+            if (need_add) {
+                PointToAdd.push_back(feats_down_world->points[i]);
+            }
         }
         else
         {
@@ -482,6 +492,19 @@ void map_incremental()
     ikdtree.Add_Points(PointNoNeedDownsample, false); 
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
+
+    if (feats_down_size > add_point_size/2)
+    {
+        printf("Warning: Only %d/%d points added to map! Possible filtering issue.\n", 
+                add_point_size, feats_down_size);
+    }
+    else
+    {
+        if (add_point_size > 0) {
+            printf("Added %d points to map from %d downsampled points\n", 
+                    add_point_size, feats_down_size);
+        }
+    }
 }
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
@@ -578,32 +601,32 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_map)
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
-
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
+    if (pub_map->get_subscription_count() == 0)
+        return;
+        
+    PointCloudXYZI::Ptr scan_publish_cloud(new PointCloudXYZI());
+    PointVector ikdtree_points;
+    ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
+    
+    // Also get deleted points back to get a complete map
+    PointVector removed_points;
+    ikdtree.acquire_removed_points(removed_points);
+    
+    // Add current scan points and removed points to the map
+    scan_publish_cloud->points = ikdtree_points;
+    scan_publish_cloud->points.insert(scan_publish_cloud->points.end(), removed_points.begin(), removed_points.end());
+    
+    sensor_msgs::msg::PointCloud2 laserCloudMap;
+    pcl::toROSMsg(*scan_publish_cloud, laserCloudMap);
+    laserCloudMap.header.stamp = rclcpp::Clock().now();
+    laserCloudMap.header.frame_id = "map";
+    pub_map->publish(laserCloudMap);
+    
+    if (scan_publish_cloud->points.size() > 0) {
+        printf("Publishing map with %lu points\n", scan_publish_cloud->points.size());
     }
-    *pcl_wait_pub += *laserCloudWorld;
-
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
 }
 
 void save_to_pcd()
@@ -656,6 +679,18 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
+
+    // Record path for map saving
+    PoseInfo current_pose;
+    current_pose.time = Measures.lidar_beg_time;
+    current_pose.x = state_point.pos(0);
+    current_pose.y = state_point.pos(1);
+    current_pose.z = state_point.pos(2);
+    current_pose.qw = state_point.rot.coeffs()[3];
+    current_pose.qx = state_point.rot.coeffs()[0];
+    current_pose.qy = state_point.rot.coeffs()[1];
+    current_pose.qz = state_point.rot.coeffs()[2];
+    path_record.push_back(current_pose);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -833,6 +868,10 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter("mapping.relocalization_mode", false);
+        this->declare_parameter("mapping.initial_pose", std::vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
+        this->declare_parameter("pcd_save.periodic_save", false);
+        this->declare_parameter("pcd_save.save_interval", 60.0);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,16 +908,15 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<bool>("mapping.relocalization_mode", relocalization_mode, false);
+        this->get_parameter_or<vector<double>>("mapping.initial_pose", initial_pose, vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
+        this->get_parameter_or<bool>("pcd_save.periodic_save", periodic_save, false);
+        this->get_parameter_or<double>("pcd_save.save_interval", save_interval, 60.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
-
-        // /*** variables definition ***/
-        // int effect_feat_num = 0, frame_num = 0;
-        // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-        // bool flg_EKF_converged, EKF_stop_flg = 0;
 
         FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
         HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
@@ -903,12 +941,9 @@ public:
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
-        /*** debug record ***/
-        // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
         fp = fopen(pos_log_dir.c_str(),"w");
 
-        // ofstream fout_pre, fout_out, fout_dbg;
         fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
         fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
         fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
@@ -917,7 +952,6 @@ public:
         else
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
-        /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
@@ -935,7 +969,6 @@ public:
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-        //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
@@ -944,7 +977,50 @@ public:
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        if (periodic_save && save_interval > 0) {
+            map_save_timer_ = this->create_wall_timer(
+                std::chrono::duration<double>(save_interval),
+                std::bind(&LaserMappingNode::saveMapCallback, this));
+            RCLCPP_INFO(this->get_logger(), "Periodic map saving enabled, interval: %.1f seconds", save_interval);
+        }
+
+        save_map_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "save_map", std::bind(&LaserMappingNode::saveMapService, this, std::placeholders::_1, std::placeholders::_2));
+        
+        load_map_service_ = this->create_service<fast_lio::srv::LoadMap>(
+            "load_map", std::bind(&LaserMappingNode::loadMapService, this, std::placeholders::_1, std::placeholders::_2));
+
+        pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 1);
+        global_map_timer_ = this->create_wall_timer(
+            std::chrono::seconds(5), 
+            std::bind(&LaserMappingNode::publishGlobalMap, this));
+
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
+
+        if (relocalization_mode) {
+            RCLCPP_INFO(this->get_logger(), "Starting in re-localization mode with initial pose");
+            
+            // Initialize state with provided initial pose
+            if (initial_pose.size() >= 7) {
+                state_point.pos = V3D(initial_pose[0], initial_pose[1], initial_pose[2]);
+                Eigen::Quaterniond q(initial_pose[3], initial_pose[4], initial_pose[5], initial_pose[6]);
+                state_point.rot = q.normalized();
+                
+                RCLCPP_INFO(this->get_logger(), "Setting initial pose to: [%.2f, %.2f, %.2f] [%.2f, %.2f, %.2f, %.2f]",
+                            state_point.pos[0], state_point.pos[1], state_point.pos[2],
+                            q.w(), q.x(), q.y(), q.z());
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Invalid initial_pose parameter, using default initialization");
+            }
+        }
+
+        // Adjust downsampling parameters
+        filter_size_map_min = this->declare_parameter("mapping.filter_size_map", 0.1); // Reduce from 0.2 to 0.1
+        filter_size_surf_min = this->declare_parameter("mapping.filter_size_surf", 0.1); // Reduce if needed
+        
+        // Update voxel grid filter settings
+        downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+        downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
     }
 
     ~LaserMappingNode()
@@ -954,7 +1030,39 @@ public:
         fclose(fp);
     }
 
-private:
+    bool loadMap(const std::string& map_path)
+    {
+        pcl::PointCloud<PointType>::Ptr loaded_map(new pcl::PointCloud<PointType>());
+        
+        if (pcl::io::loadPCDFile<PointType>(map_path, *loaded_map) == -1) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to load map from %s", map_path.c_str());
+            return false;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Loaded map with %lu points from %s", 
+                    loaded_map->size(), map_path.c_str());
+        
+        // Clear current map using DeleteTree() method
+        ikdtree.InitializeKDTree(); // Reset the tree with default parameters
+        
+        // Insert loaded points into ikd-tree
+        ikdtree.Build(loaded_map->points);
+        return true;
+    }
+
+    bool loadMapService(const std::shared_ptr<fast_lio::srv::LoadMap::Request> request,
+                       std::shared_ptr<fast_lio::srv::LoadMap::Response> response)
+    {
+        bool success = loadMap(request->map_path);
+        response->success = success;
+        if (success) {
+            response->message = "Map loaded successfully";
+        } else {
+            response->message = "Failed to load map";
+        }
+        return true;
+    }
+
     void timer_callback()
     {
         if(sync_packages(Measures))
@@ -1015,8 +1123,6 @@ private:
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
             
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
-
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
@@ -1112,7 +1218,7 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    void map_save_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
@@ -1126,6 +1232,109 @@ private:
             res->success = false;
             res->message = "Map save disabled.";
         }
+    }
+
+    void saveMapCallback()
+    {
+        if (!pcd_save_en) return;
+        
+        RCLCPP_INFO(this->get_logger(), "Saving global map...");
+        
+        // Get current time and format as ISO date
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
+        std::string timestamp_str = ss.str();
+        
+        // Use formatted timestamp for filenames
+        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + "Global_Map_" + 
+                             timestamp_str + ".pcd");
+        
+        pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
+        
+        // Use the correct ikd-Tree API calls
+        PointVector removed_points;
+        ikdtree.acquire_removed_points(removed_points);
+        
+        // Get the current map - manually traverse to get points
+        ikdtree.flatten(ikdtree.Root_Node, global_map->points, NOT_RECORD);
+        
+        // Add the removed points back to the global map
+        global_map->insert(global_map->end(), removed_points.begin(), removed_points.end());
+        
+        RCLCPP_INFO(this->get_logger(), "Saving global map with %lu points to %s", 
+                   global_map->points.size(), all_points_dir.c_str());
+        
+        pcl::io::savePCDFileBinary(all_points_dir, *global_map);
+        
+        // Save trajectory for re-localization reference
+        string trajectory_dir(string(string(ROOT_DIR) + "PCD/") + "trajectory_" + 
+                             timestamp_str + ".txt");
+        ofstream trajectory_file;
+        trajectory_file.open(trajectory_dir, ios::out);
+        for(const auto& pose : path_record)
+        {
+            trajectory_file << pose.time << " " 
+                            << pose.x << " " << pose.y << " " << pose.z << " "
+                            << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << endl;
+        }
+        trajectory_file.close();
+        
+        RCLCPP_INFO(this->get_logger(), "Global map and trajectory saved successfully");
+    }
+
+    bool saveMapService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        saveMapCallback(); // Now calls the class method
+        response->success = true;
+        response->message = "Map saved successfully";
+        return true;
+    }
+
+    void publishGlobalMap()
+    {
+        if (pubGlobalMap_->get_subscription_count() == 0)
+            return;
+        
+        pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
+        
+        // Get all points from the tree
+        PointVector ikdtree_points;
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
+        
+        // Get deleted points
+        PointVector removed_points;
+        ikdtree.acquire_removed_points(removed_points);
+        
+        // Combine all points
+        global_map->points = ikdtree_points;
+        global_map->points.insert(global_map->points.end(), removed_points.begin(), removed_points.end());
+        
+        if (global_map->points.empty()) {
+            RCLCPP_WARN(this->get_logger(), "Global map is empty, not publishing");
+            return;
+        }
+        
+        // Apply very light downsampling for visualization if the map is large
+        if (global_map->points.size() > 1000000) {
+            pcl::VoxelGrid<PointType> downSizeFilter;
+            downSizeFilter.setLeafSize(0.1, 0.1, 0.1);
+            
+            pcl::PointCloud<PointType>::Ptr filtered_map(new pcl::PointCloud<PointType>());
+            downSizeFilter.setInputCloud(global_map);
+            downSizeFilter.filter(*filtered_map);
+            global_map = filtered_map;
+        }
+        
+        sensor_msgs::msg::PointCloud2 globalMapMsg;
+        pcl::toROSMsg(*global_map, globalMapMsg);
+        globalMapMsg.header.stamp = this->now();
+        globalMapMsg.header.frame_id = "map";
+        pubGlobalMap_->publish(globalMapMsg);
+        
+        RCLCPP_INFO(this->get_logger(), "Published global map with %lu points", global_map->points.size());
     }
 
 private:
@@ -1184,7 +1393,7 @@ int main(int argc, char** argv)
         fp2 = fopen(log_dir.c_str(),"w");
         fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
         for (int i = 0;i<time_log_counter; i++){
-            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
+            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot10[i]), int(s_plot11[i]));
             t.push_back(T1[i]);
             s_vec.push_back(s_plot9[i]);
             s_vec2.push_back(s_plot3[i] + s_plot6[i]);

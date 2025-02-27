@@ -43,6 +43,32 @@ def generate_launch_description():
         description='RViz config file path'
     )
 
+  # Tf transformations
+    """
+    transform_map = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_init_to_map',
+        arguments=['0', '0', '0', '1.570795', '0', '1.570795', 'map', 'camera_init'],
+    )
+
+    transform_camera = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='base_link_to_camera',
+        arguments=['0', '0', '0', '-1.570795', '-1.570795', '0', 'camera', 'base_footprint'],
+    )
+    """
+
+    # transform_camera = Node(
+    #   package='tf2_ros',
+    #   executable='static_transform_publisher',
+    #   name='base_link_to_camera',
+    #   # arguments=['0', '0', '0', '-1.570795', '-1.570795', '0','base_link', 'camera'],
+    #   arguments=['0', '0', '0', '-1.570795', '-1.570795', '0','camera', 'base_footprint'],
+    # )
+
+
     fast_lio_node = Node(
         package='fast_lio',
         executable='fastlio_mapping',
@@ -50,14 +76,20 @@ def generate_launch_description():
                     {'use_sim_time': use_sim_time}],
         output='screen'
     )
+    """
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         arguments=['-d', rviz_cfg],
         condition=IfCondition(rviz_use)
     )
+    """
 
-    ld = LaunchDescription()
+    ld = LaunchDescription([
+        #transform_map,
+        #transform_camera,
+
+    ])
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_config_path_cmd)
     ld.add_action(decalre_config_file_cmd)
@@ -65,6 +97,6 @@ def generate_launch_description():
     ld.add_action(declare_rviz_config_path_cmd)
 
     ld.add_action(fast_lio_node)
-    ld.add_action(rviz_node)
+    # ld.add_action(rviz_node)
 
     return ld

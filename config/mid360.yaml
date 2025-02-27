@@ -3,8 +3,8 @@
         feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
+        filter_size_surf: 0.1
+        filter_size_map: 0.1
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
@@ -35,6 +35,8 @@
             extrinsic_R: [ 1., 0., 0.,
                             0., 1., 0.,
                             0., 0., 1.]
+            relocalization_mode: false    # Set to true to enable re-localization mode
+            initial_pose: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]  # x, y, z, qw, qx, qy, qz
 
         publish:
             path_en: true                # true: publish Path
@@ -48,3 +50,5 @@
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+            periodic_save: true         # Enable periodic map saving
+            save_interval: 60.0         # Save map every 60 seconds
