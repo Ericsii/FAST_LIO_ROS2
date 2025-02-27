@@ -66,6 +66,7 @@
 #include <pcl/registration/icp.h>
 #include <iomanip>
 #include <sstream>
+#include "scan_context.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -535,7 +536,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
+    /* 2. noted that pcd save will largely influence the real-time performences **/
     /*
     if (pcd_save_en)
     {
@@ -964,16 +965,12 @@ public:
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
-
-        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
@@ -1021,6 +1018,31 @@ public:
         // Update voxel grid filter settings
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+
+        // Loop closure parameters
+        this->declare_parameter<bool>("loop_closure.enabled", true);
+        this->declare_parameter<double>("loop_closure.search_radius", LOOP_CLOSURE_SEARCH_RADIUS);
+        this->declare_parameter<double>("loop_closure.min_distance", LOOP_CLOSURE_MIN_DIST);
+        this->declare_parameter<int>("loop_closure.detection_interval", LOOP_CLOSURE_DETECTION_INTERVAL);
+        this->declare_parameter<double>("loop_closure.fitness_score_threshold", LOOP_CLOSURE_FITNESS_SCORE_THRESH);
+        
+        loop_closure_enabled_ = this->get_parameter("loop_closure.enabled").as_bool();
+        loop_closure_search_radius_ = this->get_parameter("loop_closure.search_radius").as_double();
+        loop_closure_min_distance_ = this->get_parameter("loop_closure.min_distance").as_double();
+        loop_closure_detection_interval_ = this->get_parameter("loop_closure.detection_interval").as_int();
+        loop_closure_fitness_score_threshold_ = this->get_parameter("loop_closure.fitness_score_threshold").as_double();
+        
+        // Publisher for loop closure markers
+        pubLoopClosureMarker_ = this->create_publisher<visualization_msgs::msg::Marker>("loop_closure_marker", 10);
+        
+        RCLCPP_INFO(this->get_logger(), "Loop closure detection %s", loop_closure_enabled_ ? "enabled" : "disabled");
+        if (loop_closure_enabled_) {
+            RCLCPP_INFO(this->get_logger(), "Loop closure parameters:");
+            RCLCPP_INFO(this->get_logger(), "  Search radius: %.2f m", loop_closure_search_radius_);
+            RCLCPP_INFO(this->get_logger(), "  Min distance: %.2f m", loop_closure_min_distance_);
+            RCLCPP_INFO(this->get_logger(), "  Detection interval: %d frames", loop_closure_detection_interval_);
+            RCLCPP_INFO(this->get_logger(), "  Fitness score threshold: %.2f", loop_closure_fitness_score_threshold_);
+        }
     }
 
     ~LaserMappingNode()
@@ -1210,12 +1232,19 @@ public:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
             }
-        }
-    }
 
-    void map_publish_callback()
-    {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+            // After processing the current frame and updating the map
+            if (loop_closure_enabled_ && flg_EKF_inited) {
+                // Add keyframe at regular intervals
+                static int frame_count = 0;
+                frame_count++;
+                
+                if (frame_count % loop_closure_detection_interval_ == 0) {
+                    addKeyFrame();
+                    detectLoopClosure();
+                }
+            }
+        }
     }
 
     void map_save_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
@@ -1337,11 +1366,155 @@ public:
         RCLCPP_INFO(this->get_logger(), "Published global map with %lu points", global_map->points.size());
     }
 
+    // Add current frame as a keyframe
+    void addKeyFrame() {
+        // Create a copy of the current point cloud
+        pcl::PointCloud<PointType>::Ptr cloud_copy(new pcl::PointCloud<PointType>());
+        *cloud_copy = *feats_down_body;
+        
+        // Create transformation matrix from current state
+        Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+        Eigen::Matrix3d rot = state_point.rot.toRotationMatrix();
+        
+        // Fill rotation part
+        pose.block<3, 3>(0, 0) = rot;
+        
+        // Fill translation part
+        pose.block<3, 1>(0, 3) = Eigen::Vector3d(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+        
+        // Create keyframe
+        std::shared_ptr<KeyFrame> keyframe = std::make_shared<KeyFrame>(
+            keyframes_.size(),
+            Measures.lidar_beg_time,
+            pose,
+            cloud_copy
+        );
+        
+        // Generate scan context for this keyframe
+        keyframe->scan_context = generateScanContext(cloud_copy);
+        
+        // Add to keyframes list
+        keyframes_.push_back(keyframe);
+        
+        RCLCPP_INFO(this->get_logger(), "Added keyframe %d at position [%.2f, %.2f, %.2f]", 
+                    static_cast<int>(keyframes_.size() - 1),
+                    state_point.pos(0), state_point.pos(1), state_point.pos(2));
+    }
+    
+    // Detect loop closure
+    void detectLoopClosure() {
+        if (keyframes_.size() < 2) {
+            return; // Not enough keyframes yet
+        }
+        
+        // Get the latest keyframe
+        std::shared_ptr<KeyFrame> current_keyframe = keyframes_.back();
+        
+        // Get current position
+        Eigen::Vector3d current_position = current_keyframe->pose.block<3, 1>(0, 3);
+        
+        // Exclude the most recent keyframes (exclude last loop_closure_detection_interval)
+        int exclude_recent_num = 1;
+        
+        // Find the best matching scan context
+        auto [match_idx, match_score] = findBestMatchingScanContext(
+            current_keyframe->scan_context,
+            keyframes_,
+            exclude_recent_num
+        );
+        
+        // If no match found
+        if (match_idx < 0) {
+            return;
+        }
+        
+        // Get the matched keyframe
+        std::shared_ptr<KeyFrame> matched_keyframe = keyframes_[match_idx];
+        
+        // Get matched position
+        Eigen::Vector3d matched_position = matched_keyframe->pose.block<3, 1>(0, 3);
+        
+        // Check if the keyframes are far enough apart
+        double distance = (current_position - matched_position).norm();
+        if (distance < loop_closure_min_distance_) {
+            return; // Too close, not a true loop closure
+        }
+        
+        // Perform ICP to refine the transformation
+        double fitness_score = 0.0;
+        Eigen::Matrix4d relative_transform = performICPMatching(
+            current_keyframe->cloud,
+            matched_keyframe->cloud,
+            Eigen::Matrix4d::Identity(), // Initial guess (can be improved)
+            &fitness_score
+        );
+        
+        // Check ICP fitness score
+        if (fitness_score > loop_closure_fitness_score_threshold_) {
+            RCLCPP_INFO(this->get_logger(), "Loop closure ICP failed: fitness score too high (%.4f > %.4f)",
+                       fitness_score, loop_closure_fitness_score_threshold_);
+            return;
+        }
+        
+        // Compute the error/drift
+        Eigen::Matrix4d expected_pose = matched_keyframe->pose;
+        Eigen::Matrix4d actual_pose = current_keyframe->pose;
+        Eigen::Matrix4d error = expected_pose.inverse() * actual_pose * relative_transform.inverse();
+        
+        // Apply correction (simplified - in a full implementation, we would update the pose graph)
+        RCLCPP_INFO(this->get_logger(), "Loop closure detected between frames %d and %d (current), distance: %.2f m, score: %.4f",
+                    match_idx, static_cast<int>(keyframes_.size() - 1), distance, match_score);
+        
+        // Publish marker for visualization
+        publishLoopClosureMarker(matched_position, current_position);
+        
+        // In a real implementation, you would:
+        // 1. Update the pose graph
+        // 2. Perform pose graph optimization
+        // 3. Update all poses
+        // 4. Rebuild the map
+        
+        // For demonstration, we'll just print the correction
+        Eigen::Vector3d translation_error = error.block<3, 1>(0, 3);
+        RCLCPP_INFO(this->get_logger(), "Detected drift: [%.2f, %.2f, %.2f] m",
+                    translation_error.x(), translation_error.y(), translation_error.z());
+    }
+    
+    // Publish a marker to visualize the loop closure
+    void publishLoopClosureMarker(const Eigen::Vector3d& position1, const Eigen::Vector3d& position2) {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "map";
+        marker.header.stamp = this->now();
+        marker.ns = "loop_closure";
+        marker.id = 0;
+        marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = 0.2; // Line width
+        marker.color.r = 1.0;
+        marker.color.g = 0.0;
+        marker.color.b = 0.0;
+        marker.color.a = 1.0;
+        
+        geometry_msgs::msg::Point p1, p2;
+        p1.x = position1.x();
+        p1.y = position1.y();
+        p1.z = position1.z();
+        
+        p2.x = position2.x();
+        p2.y = position2.y();
+        p2.z = position2.z();
+        
+        marker.points.push_back(p1);
+        marker.points.push_back(p2);
+        
+        pubLoopClosureMarker_->publish(marker);
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
@@ -1350,7 +1523,6 @@ private:
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
@@ -1361,6 +1533,15 @@ private:
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
+    
+    // Loop closure related
+    bool loop_closure_enabled_;
+    double loop_closure_search_radius_;
+    double loop_closure_min_distance_;
+    int loop_closure_detection_interval_;
+    double loop_closure_fitness_score_threshold_;
+    std::vector<std::shared_ptr<KeyFrame>> keyframes_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pubLoopClosureMarker_;
 };
 
 int main(int argc, char** argv)
