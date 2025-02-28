@@ -162,6 +162,12 @@ rclcpp::Service<fast_lio::srv::LoadMap>::SharedPtr load_map_service_;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubGlobalMap_;
 rclcpp::TimerBase::SharedPtr global_map_timer_;
 
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
+rclcpp::TimerBase::SharedPtr local_map_timer_;
+PointCloudXYZI::Ptr accumulated_cloud_;
+rclcpp::Time last_local_map_time_;
+std::mutex local_map_mutex_;
+
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -454,6 +460,9 @@ bool sync_packages(MeasureGroup &meas)
 }
 
 int process_increments = 0;
+bool suppress_point_warnings = false; // Add this flag to control warnings
+int warning_counter = 0; // Counter for reducing warning frequency
+int info_message_counter = 0; // Counter for reducing normal info messages
 void map_incremental()
 {
     PointVector PointToAdd;
@@ -495,16 +504,22 @@ void map_incremental()
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
 
-    if (feats_down_size > add_point_size/2)
+    warning_counter++;
+    info_message_counter++;
+    
+    if (feats_down_size > add_point_size/2 && !suppress_point_warnings && warning_counter >= 50)
     {
         printf("Warning: Only %d/%d points added to map! Possible filtering issue.\n", 
                 add_point_size, feats_down_size);
+        warning_counter = 0; // Reset counter after showing warning
     }
     else
     {
-        if (add_point_size > 0) {
+        // Only show "Added points" messages every 200 frames to reduce console spam
+        if (add_point_size > 0 && info_message_counter >= 200) {
             printf("Added %d points to map from %d downsampled points\n", 
                     add_point_size, feats_down_size);
+            info_message_counter = 0; // Reset counter after showing info
         }
     }
 }
@@ -633,6 +648,17 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
 
 void save_to_pcd()
 {
+    // This method is deprecated and maintained for backward compatibility
+    // It's better to use the LaserMappingNode::saveMapService or LaserMappingNode::saveMapCallback methods
+    RCLCPP_WARN(rclcpp::get_logger("rclcpp"), "save_to_pcd() is deprecated. Use service calls or periodic saving instead.");
+    
+    // Ensure PCD directory exists
+    std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+    if (!std::filesystem::exists(pcd_dir)) {
+        std::filesystem::create_directories(pcd_dir);
+    }
+    
+    // Save to the configured path (typically test.pcd) for backward compatibility
     pcl::PCDWriter pcd_writer;
     pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
@@ -874,6 +900,7 @@ public:
         this->declare_parameter("mapping.initial_pose", std::vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
         this->declare_parameter("pcd_save.periodic_save", false);
         this->declare_parameter("pcd_save.save_interval", 60.0);
+        this->declare_parameter("mapping.suppress_warnings", false);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -914,6 +941,13 @@ public:
         this->get_parameter_or<vector<double>>("mapping.initial_pose", initial_pose, vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
         this->get_parameter_or<bool>("pcd_save.periodic_save", periodic_save, false);
         this->get_parameter_or<double>("pcd_save.save_interval", save_interval, 60.0);
+        this->get_parameter_or<bool>("mapping.suppress_warnings", suppress_point_warnings, false);
+        
+        // For sequential scan TOF lidars, these warnings are expected, so suppress them by default
+        if (p_pre->lidar_type == AVIA) {
+            RCLCPP_INFO(this->get_logger(), "Sequential scan TOF lidar detected, suppressing point filter warnings by default");
+            suppress_point_warnings = true;
+        }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -993,6 +1027,18 @@ public:
             std::chrono::seconds(5), 
             std::bind(&LaserMappingNode::publishGlobalMap, this));
 
+        // Initialize local map accumulation
+        accumulated_cloud_.reset(new PointCloudXYZI());
+        last_local_map_time_ = this->get_clock()->now();
+        
+        // Create publisher for local map
+        pubLocalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/local_map", 1);
+        
+        // Create timer for local map publishing (1Hz)
+        local_map_timer_ = this->create_wall_timer(
+            std::chrono::seconds(1), 
+            std::bind(&LaserMappingNode::publishLocalMap, this));
+        
         // After node initialization and parameter loading, before RCLCPP_INFO about node init finished
         // Add automatic map loading and relocalization
         std::string pcd_dir = string(ROOT_DIR) + "PCD/";
@@ -1006,14 +1052,14 @@ public:
                 relocalization_mode = true;
                 
                 // In relocalization mode, we don't set the initial pose here
-                // The system will automatically determine the position using scan context
+                // The system will automatically determine the position using accumulated scans
                 // when enough measurements have been received to perform place recognition
-                RCLCPP_INFO(this->get_logger(), "Automatic relocalization will be performed using scan context when enough measurements are received");
+                RCLCPP_INFO(this->get_logger(), "Automatic relocalization will be performed when enough measurements are received");
             } else {
                 RCLCPP_WARN(this->get_logger(), "Failed to load map, continuing without relocalization");
             }
         }
-
+        
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
 
         if (relocalization_mode) {
@@ -1133,44 +1179,91 @@ public:
 
     void timer_callback()
     {
-        static bool relocalization_done = false;
-
-        if (relocalization_mode && !relocalization_done)
+        // Remove static declarations since we now use class members
+        if (relocalization_mode && !relocalization_done_)
         {
-            // If we're in relocalization mode and haven't succeeded yet, try to relocalize
-            if (imu_buffer.empty() || lidar_buffer.empty()) {
+            if (!sync_packages(Measures)) {
                 return;
             }
 
-            // Process the latest data to update point clouds
-            MeasureGroup measures;
-            if (!sync_packages(measures)) {
+            p_imu->Process(Measures, kf, feats_undistort);
+            feats_down_body->clear();
+            feats_down_world->clear();
+            
+            // Filter points and transform them to world frame
+            for (int i = 0; i < feats_undistort->points.size(); i++)
+            {
+                if (i % p_pre->point_filter_num == 0)
+                {
+                    PointType p_body(feats_undistort->points[i]);
+                    feats_down_body->points.push_back(p_body);
+                    
+                    PointType p_world;
+                    pointBodyToWorld(&p_body, &p_world);
+                    feats_down_world->points.push_back(p_world);
+                }
+            }
+            
+            // Update size for further processing
+            feats_down_size = feats_down_world->points.size();
+            
+            // Add these points to our accumulated local map
+            accumulateLocalMap(feats_down_world);
+            
+            // Try relocalization if we have accumulated enough points
+            if (accumulated_cloud_->points.size() > 3000) {
+                if (attemptRelocalization()) {
+                    relocalization_done_ = true;
+                    relocalization_reset_needed_ = true;
+                    
+                    // Clear the accumulated cloud now that relocalization succeeded
+                    accumulated_cloud_->clear();
+                    RCLCPP_INFO(this->get_logger(), "Relocalization completed successfully. System state and map have been reset to the new position.");
+                    
+                    // Force a reset of the lidar_buffer and imu_buffer to avoid using outdated measurements
+                    mtx_buffer.lock();
+                    lidar_buffer.clear();
+                    imu_buffer.clear();
+                    mtx_buffer.unlock();
+                    
+                    // Return early to ensure the next scan starts fresh with the new position
+                    return;
+                } else {
+                    RCLCPP_INFO(this->get_logger(), "Attempting relocalization (accumulated %zu points, need more data...)", 
+                               accumulated_cloud_->points.size());
+                }
+            } else {
+                RCLCPP_INFO(this->get_logger(), "Accumulating points for relocalization: %zu/%d", 
+                           accumulated_cloud_->points.size(), 3000);
+            }
+            
+            // Skip the rest of processing until relocalized
+            if (!relocalization_done_) return;
+        }
+
+        // Handle first scan after relocalization
+        if (relocalization_done_ && relocalization_reset_needed_) {
+            if (!sync_packages(Measures)) {
                 return;
             }
             
-            if (feats_undistort->empty()) {
-                RCLCPP_WARN(get_logger(), "Features undistort empty, skipping relocalization attempt");
-                return;
-            }
-
-            // Process the IMU data to update the state
-            p_imu->Process(measures, kf, feats_undistort);
-
-            // Do feature extraction and downsampling
-            if (feats_down_body->empty()) {
-                pcl::PointCloud<PointType>::Ptr feats_down(new pcl::PointCloud<PointType>());
-                downSizeFilterSurf.setInputCloud(feats_undistort);
-                downSizeFilterSurf.filter(*feats_down_body);
-            }
-
-            // Attempt relocalization
-            if (attemptRelocalization()) {
-                RCLCPP_INFO(get_logger(), "Relocalization successful! Continuing normal operation.");
-                relocalization_done = true;
-            } else {
-                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "Attempting relocalization... (not enough data or no match found yet)");
-                return; // Skip the rest until we have a position
-            }
+            // Reset this flag to indicate we've handled the relocalization reset
+            relocalization_reset_needed_ = false;
+            
+            // Need to reinitialize first_lidar_time to avoid discontinuities
+            first_lidar_time = Measures.lidar_beg_time;
+            p_imu->first_lidar_time = first_lidar_time;
+            
+            // Set flag to force re-initialization properly using public properties 
+            // instead of accessing private members
+            p_imu->Reset(); // Use the public Reset() method to fully reset IMU state
+            
+            // Start scan processing from beginning
+            flg_first_scan = true;
+            flg_EKF_inited = false;
+            
+            RCLCPP_INFO(this->get_logger(), "Processing first scan after successful relocalization with full IMU reset");
+            return; // Skip the rest of the processing to force a complete restart cycle
         }
 
         /*** Segment the map in lidar FOV ***/
@@ -1328,25 +1421,15 @@ public:
 
     void map_save_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
-        }
-        else
-        {
-            res->success = false;
-            res->message = "Map save disabled.";
-        }
+        // Delegate to the service method that handles on-demand saving to global_map.pcd
+        saveMapService(req, res);
     }
 
     void saveMapCallback()
     {
         if (!pcd_save_en) return;
         
-        RCLCPP_INFO(this->get_logger(), "Saving global map...");
+        RCLCPP_INFO(this->get_logger(), "Saving periodic map snapshot...");
         
         // Ensure PCD directory exists
         std::string pcd_dir = string(ROOT_DIR) + "PCD/";
@@ -1355,8 +1438,68 @@ public:
             std::filesystem::create_directories(pcd_dir);
         }
         
-        // Fixed filename for the global map
-        string all_points_dir(pcd_dir + "global_map.pcd");
+        // Generate timestamped filename for periodic saves
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
+        std::string timestamp_str = ss.str();
+        
+        // Use timestamped filename format for periodic saves
+        string periodic_map_path(pcd_dir + "Global_Map_" + timestamp_str + ".pcd");
+        
+        pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
+        
+        // Use the correct ikd-Tree API calls
+        PointVector removed_points;
+        ikdtree.acquire_removed_points(removed_points);
+        
+        // Get the current map - manually traverse to get points
+        ikdtree.flatten(ikdtree.Root_Node, global_map->points, NOT_RECORD);
+        
+        // Add the removed points back to the global map
+        global_map->insert(global_map->end(), removed_points.begin(), removed_points.end());
+        
+        RCLCPP_INFO(this->get_logger(), "Saving periodic map snapshot with %lu points to %s", 
+                   global_map->points.size(), periodic_map_path.c_str());
+        
+        pcl::io::savePCDFileBinary(periodic_map_path, *global_map);
+        
+        // Save trajectory for re-localization reference using timestamp to avoid overwriting
+        string trajectory_dir(pcd_dir + "trajectory_" + timestamp_str + ".txt");
+        ofstream trajectory_file;
+        trajectory_file.open(trajectory_dir, ios::out);
+        for(const auto& pose : path_record)
+        {
+            trajectory_file << pose.time << " " 
+                            << pose.x << " " << pose.y << " " << pose.z << " "
+                            << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << endl;
+        }
+        trajectory_file.close();
+        
+        RCLCPP_INFO(this->get_logger(), "Periodic map snapshot and trajectory saved successfully");
+    }
+
+    bool saveMapService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        if (!pcd_save_en) {
+            response->success = false;
+            response->message = "Map saving is disabled";
+            return true;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Saving global map via service call...");
+        
+        // Ensure PCD directory exists
+        std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+        if (!std::filesystem::exists(pcd_dir)) {
+            RCLCPP_INFO(this->get_logger(), "Creating PCD directory: %s", pcd_dir.c_str());
+            std::filesystem::create_directories(pcd_dir);
+        }
+        
+        // Fixed filename for the global map (service call always saves to global_map.pcd)
+        string global_map_path(pcd_dir + "global_map.pcd");
         
         pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
         
@@ -1371,11 +1514,11 @@ public:
         global_map->insert(global_map->end(), removed_points.begin(), removed_points.end());
         
         RCLCPP_INFO(this->get_logger(), "Saving global map with %lu points to %s", 
-                   global_map->points.size(), all_points_dir.c_str());
+                   global_map->points.size(), global_map_path.c_str());
         
-        pcl::io::savePCDFileBinary(all_points_dir, *global_map);
+        pcl::io::savePCDFileBinary(global_map_path, *global_map);
         
-        // Save trajectory for re-localization reference using timestamp to avoid overwriting
+        // Save current trajectory
         auto now = std::chrono::system_clock::now();
         auto in_time_t = std::chrono::system_clock::to_time_t(now);
         std::stringstream ss;
@@ -1394,14 +1537,9 @@ public:
         trajectory_file.close();
         
         RCLCPP_INFO(this->get_logger(), "Global map and trajectory saved successfully");
-    }
-
-    bool saveMapService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-                       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-    {
-        saveMapCallback(); // Now calls the class method
+        
         response->success = true;
-        response->message = "Map saved successfully";
+        response->message = "Global map saved successfully to " + global_map_path;
         return true;
     }
 
@@ -1594,90 +1732,251 @@ public:
         pubLoopClosureMarker_->publish(marker);
     }
 
-    bool attemptRelocalization() {
-        if (keyframes_.size() < 2 || feats_down_size < 100) {
-            // Not enough keyframes or current scan is too sparse
+    bool attemptRelocalization() 
+    {
+        // Check if we have loaded a map keyframe
+        if (keyframes_.size() < 1) {
+            RCLCPP_INFO(this->get_logger(), "Cannot attempt relocalization, no keyframes loaded (%zu keyframes, %zu points)", 
+                       keyframes_.size(), accumulated_cloud_->points.size());
             return false;
         }
         
-        // Create a point cloud from the current scan
-        pcl::PointCloud<PointType>::Ptr current_cloud(new pcl::PointCloud<PointType>());
-        *current_cloud = *feats_down_body;
-        
-        // Generate scan context for current scan
-        Eigen::MatrixXd current_sc = generateScanContext(current_cloud);
-        
-        // The first keyframe (index 0) is our map, try to match against it
-        auto map_keyframe = keyframes_[0];
-        
-        // Calculate similarity between current scan and map
-        double similarity_score = calculateContextSimilarity(current_sc, map_keyframe->scan_context);
-        
-        // Only attempt ICP if the scan context similarity is good enough
-        if (similarity_score > SC_DIST_THRES) {
-            RCLCPP_INFO(this->get_logger(), "Scan context similarity too low (%.4f > %.4f), still searching for position",
-                       similarity_score, SC_DIST_THRES);
+        // Ensure we have enough points in the accumulated cloud for a robust match
+        // Increased from 1000 to 3000 points for better relocalization in new positions
+        if (accumulated_cloud_->points.size() < 3000) {
+            RCLCPP_INFO(this->get_logger(), "Not enough points for relocalization (%zu points, need at least 3000)", 
+                       accumulated_cloud_->points.size());
             return false;
         }
         
-        // We have a potential match, perform ICP to get the precise transform
-        double fitness_score = 0.0;
+        RCLCPP_INFO(this->get_logger(), "Attempting relocalization with accumulated cloud of %zu points", 
+                   accumulated_cloud_->points.size());
         
-        // Initial guess is identity - we don't know where we are yet
-        Eigen::Matrix4d initial_guess = Eigen::Matrix4d::Identity();
+        // Get the first keyframe (the map)
+        std::shared_ptr<KeyFrame> map_keyframe = keyframes_[0];
         
-        Eigen::Matrix4d transform = performICPMatching(
-            current_cloud,
-            map_keyframe->cloud,
-            initial_guess,
-            &fitness_score
-        );
+        // Use the accumulated cloud
+        PointCloudXYZI::Ptr source_cloud(new PointCloudXYZI(*accumulated_cloud_));
+        PointCloudXYZI::Ptr target_cloud(new PointCloudXYZI(*map_keyframe->cloud));
         
-        // Check ICP fitness score
-        if (fitness_score > LOOP_CLOSURE_FITNESS_SCORE_THRESH) {
-            RCLCPP_INFO(this->get_logger(), "Relocalization ICP failed: fitness score too high (%.4f > %.4f)",
-                       fitness_score, LOOP_CLOSURE_FITNESS_SCORE_THRESH);
-            return false;
+        // Filter clouds for faster ICP - use a safe leaf size to avoid integer overflow
+        PointCloudXYZI::Ptr source_filtered(new PointCloudXYZI());
+        PointCloudXYZI::Ptr target_filtered(new PointCloudXYZI());
+        
+        // Temporarily set a larger leaf size to avoid the integer overflow issue
+        double original_leaf_size = filter_size_map_min;
+        double safe_leaf_size = std::max(0.2, original_leaf_size); // Use at least 0.2m leaf size
+        
+        pcl::VoxelGrid<PointType> temp_filter;
+        temp_filter.setLeafSize(safe_leaf_size, safe_leaf_size, safe_leaf_size);
+        
+        // Filter source and target using the safer parameters
+        temp_filter.setInputCloud(source_cloud);
+        temp_filter.filter(*source_filtered);
+        
+        temp_filter.setInputCloud(target_cloud);
+        temp_filter.filter(*target_filtered);
+        
+        RCLCPP_INFO(this->get_logger(), "Filtered source cloud: %zu points, target cloud: %zu points",
+                  source_filtered->points.size(), target_filtered->points.size());
+        
+        // Define a list of initial transformations to try
+        // This helps ICP find the correct alignment even with large displacements
+        std::vector<Eigen::Matrix4f> initial_transformations;
+        
+        // Add identity matrix (no transformation - default)
+        Eigen::Matrix4f identity = Eigen::Matrix4f::Identity();
+        initial_transformations.push_back(identity);
+        
+        // Add translation of 5m along X (forward)
+        Eigen::Matrix4f trans_5m_x = Eigen::Matrix4f::Identity();
+        trans_5m_x(0, 3) = 5.0;  // 5m in x direction
+        initial_transformations.push_back(trans_5m_x);
+        
+        // Add translation of 5m along Y (right)
+        Eigen::Matrix4f trans_5m_y = Eigen::Matrix4f::Identity();
+        trans_5m_y(1, 3) = 5.0;  // 5m in y direction
+        initial_transformations.push_back(trans_5m_y);
+        
+        // Add translation of -5m along Y (left)
+        Eigen::Matrix4f trans_neg_5m_y = Eigen::Matrix4f::Identity();
+        trans_neg_5m_y(1, 3) = -5.0;  // -5m in y direction
+        initial_transformations.push_back(trans_neg_5m_y);
+        
+        // Also try 10m in x direction (based on the screenshot showing ~10m displacement)
+        Eigen::Matrix4f trans_10m_x = Eigen::Matrix4f::Identity();
+        trans_10m_x(0, 3) = 10.0;
+        initial_transformations.push_back(trans_10m_x);
+        
+        // Store best result
+        bool converged = false;
+        float best_fitness_score = std::numeric_limits<float>::max();
+        Eigen::Matrix4f best_transformation = Eigen::Matrix4f::Identity();
+        
+        // Try each initial transformation
+        for (size_t i = 0; i < initial_transformations.size(); i++) {
+            // Perform ICP to find the transformation
+            pcl::IterativeClosestPoint<PointType, PointType> icp;
+            // Increase max correspondence distance to handle larger displacements
+            icp.setMaxCorrespondenceDistance(10.0);
+            // Increase max iterations for more thorough alignment
+            icp.setMaximumIterations(200);
+            icp.setTransformationEpsilon(1e-6);
+            icp.setEuclideanFitnessEpsilon(1e-6);
+            
+            // Set initial transformation
+            icp.setInputSource(source_filtered);
+            icp.setInputTarget(target_filtered);
+            
+            // Set initial alignment
+            Eigen::Matrix4f init_guess = initial_transformations[i];
+            
+            RCLCPP_INFO(this->get_logger(), "Trying initial transformation #%zu", i);
+            
+            PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
+            icp.align(*aligned, init_guess);
+            
+            float fitness_score = icp.getFitnessScore();
+            RCLCPP_INFO(this->get_logger(), "Initial guess %zu: Converged=%d, Fitness score=%f", 
+                       i, icp.hasConverged(), fitness_score);
+            
+            // Update best result if this one is better
+            if (icp.hasConverged() && fitness_score < best_fitness_score) {
+                converged = true;
+                best_fitness_score = fitness_score;
+                best_transformation = icp.getFinalTransformation();
+            }
         }
         
-        // We found our position! Update the state
-        // Extract rotation matrix
-        Eigen::Matrix3d rotation_matrix = transform.block<3, 3>(0, 0);
+        // Check if any of the attempts converged with a good fitness score
+        if (converged && best_fitness_score < 5.0) {
+            // Extract transformation parameters
+            Eigen::Matrix3f rotation_matrix = best_transformation.block<3,3>(0,0);
+            Eigen::Vector3f translation = best_transformation.block<3,1>(0,3);
+            
+            // Convert to quaternion
+            Eigen::Quaternionf q(rotation_matrix);
+            
+            RCLCPP_INFO(this->get_logger(), "Relocalization successful! Position: [%f, %f, %f], Orientation (quat): [%f, %f, %f, %f], Fitness score: %f", 
+                       translation(0), translation(1), translation(2),
+                       q.w(), q.x(), q.y(), q.z(),
+                       best_fitness_score);
+            
+            // Update the state with the found position
+            state_point.pos = V3D(translation(0), translation(1), translation(2));
+            state_point.rot = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+            
+            // Reset the velocity and bias states - these should be re-estimated from the new position
+            state_point.vel.setZero();
+            state_point.bg.setZero();
+            state_point.ba.setZero();
+            
+            // Update derived state variables used for odometry and mapping
+            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            geoQuat.x = state_point.rot.coeffs()[0];
+            geoQuat.y = state_point.rot.coeffs()[1];
+            geoQuat.z = state_point.rot.coeffs()[2];
+            geoQuat.w = state_point.rot.coeffs()[3];
+            
+            // Reset KF filter state to match the new position
+            kf.change_x(state_point);
+            
+            // Reset EKF covariance to initial values
+            esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P = kf.get_P();
+            P.setIdentity();
+            P(6,6) = P(7,7) = P(8,8) = 0.00001;
+            P(9,9) = P(10,10) = P(11,11) = 0.00001;
+            P(15,15) = P(16,16) = P(17,17) = 0.0001;
+            P(18,18) = P(19,19) = P(20,20) = 0.001;
+            P(21,21) = P(22,22) = 0.00001;
+            kf.change_P(P);
+            
+            // Clear the path to start from the relocated position
+            path.poses.clear();
+            
+            // Clear the map and create a new tree with the keyframe data
+            ikdtree.InitializeKDTree();
+            
+            // Use the first keyframe cloud as the initial map
+            PointCloudXYZI::Ptr initial_map(new PointCloudXYZI(*map_keyframe->cloud));
+            ikdtree.Build(initial_map->points);
+            
+            // Completely reset the IMU processor to avoid velocity discontinuities
+            p_imu->Reset();
+            
+            // Remove these lines that reference the local variables that no longer exist
+            // relocalization_done = true;
+            // relocalization_reset_needed = true;
+            
+            // Reset internal variables to ensure clean restart
+            flg_EKF_inited = false;
+            
+            // Immediately publish the updated odometry to reflect the new position
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            
+            return true;
+        } else {
+            RCLCPP_WARN(this->get_logger(), "All ICP attempts failed to find a good match. Best fitness score: %f", 
+                       best_fitness_score);
+            return false;
+        }
+    }
+
+    void publishLocalMap() {
+        std::lock_guard<std::mutex> lock(local_map_mutex_);
         
-        // Convert to quaternion
-        Eigen::Quaterniond q(rotation_matrix);
-        q.normalize();
+        if (accumulated_cloud_->points.empty()) {
+            return;
+        }
         
-        // Extract translation
-        Eigen::Vector3d translation = transform.block<3, 1>(0, 3);
+        // Create a copy of the accumulated cloud
+        PointCloudXYZI::Ptr local_map(new PointCloudXYZI(*accumulated_cloud_));
         
-        // Update state
-        state_point.pos = V3D(translation(0), translation(1), translation(2));
-        state_point.rot = q;
+        // Downsample the local map
+        PointCloudXYZI::Ptr local_map_ds(new PointCloudXYZI());
+        downSizeFilterMap.setInputCloud(local_map);
+        downSizeFilterMap.filter(*local_map_ds);
         
-        RCLCPP_INFO(this->get_logger(), "Relocalization successful! Setting position to: [%.2f, %.2f, %.2f]",
-                    translation(0), translation(1), translation(2));
+        // Publish the local map
+        sensor_msgs::msg::PointCloud2 local_map_msg;
+        pcl::toROSMsg(*local_map_ds, local_map_msg);
+        local_map_msg.header.stamp = this->get_clock()->now();
+        local_map_msg.header.frame_id = "camera_init";
+        pubLocalMap_->publish(local_map_msg);
         
-        // Create a new keyframe at the found position
-        Eigen::Matrix4d current_pose = Eigen::Matrix4d::Identity();
-        current_pose.block<3, 3>(0, 0) = rotation_matrix;
-        current_pose.block<3, 1>(0, 3) = translation;
+        RCLCPP_DEBUG(this->get_logger(), "Published local map with %lu points", local_map_ds->points.size());
+    }
+    
+    // Add a method to accumulate points for the local map
+    void accumulateLocalMap(const PointCloudXYZI::Ptr& transformed_cloud) {
+        std::lock_guard<std::mutex> lock(local_map_mutex_);
         
-        std::shared_ptr<KeyFrame> new_keyframe = std::make_shared<KeyFrame>(
-            keyframes_.size(),
-            Measures.lidar_beg_time,
-            current_pose,
-            current_cloud
-        );
+        // Calculate time difference
+        rclcpp::Time current_time = this->get_clock()->now();
+        double time_diff = (current_time - last_local_map_time_).seconds();
         
-        // Generate scan context
-        new_keyframe->scan_context = current_sc;
+        // Reset accumulated cloud if more than 5 seconds have passed (increased from 2 seconds)
+        // Only reset if we're not in relocalization mode, otherwise keep accumulating
+        if (time_diff > 5.0 && !relocalization_mode) {
+            accumulated_cloud_->clear();
+            last_local_map_time_ = current_time;
+        } else {
+            // Just update the timestamp without clearing if in relocalization mode
+            last_local_map_time_ = current_time;
+        }
         
-        // Add to keyframes
-        keyframes_.push_back(new_keyframe);
+        // Add transformed points to accumulated cloud
+        *accumulated_cloud_ += *transformed_cloud;
         
-        // We successfully relocalized
-        return true;
+        // Cap the number of points to prevent excessive memory usage
+        // Increased from 100,000 to 250,000 for better relocalization
+        if (accumulated_cloud_->points.size() > 250000) {
+            // Downsample the cloud
+            PointCloudXYZI::Ptr temp(new PointCloudXYZI());
+            downSizeFilterSurf.setInputCloud(accumulated_cloud_);
+            downSizeFilterSurf.filter(*temp);
+            accumulated_cloud_ = temp;
+        }
     }
 
 private:
@@ -1711,6 +2010,15 @@ private:
     double loop_closure_fitness_score_threshold_;
     std::vector<std::shared_ptr<KeyFrame>> keyframes_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pubLoopClosureMarker_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
+    rclcpp::TimerBase::SharedPtr local_map_timer_;
+    PointCloudXYZI::Ptr accumulated_cloud_;
+    rclcpp::Time last_local_map_time_;
+    std::mutex local_map_mutex_;
+    
+    // Relocalization state tracking
+    bool relocalization_done_ = false;
+    bool relocalization_reset_needed_ = false;
 };
 
 int main(int argc, char** argv)
