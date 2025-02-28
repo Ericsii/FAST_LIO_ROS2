@@ -67,6 +67,7 @@
 #include <iomanip>
 #include <sstream>
 #include "scan_context.h"
+#include <filesystem>  // Add this include for std::filesystem
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -992,23 +993,34 @@ public:
             std::chrono::seconds(5), 
             std::bind(&LaserMappingNode::publishGlobalMap, this));
 
+        // After node initialization and parameter loading, before RCLCPP_INFO about node init finished
+        // Add automatic map loading and relocalization
+        std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+        std::string default_map_path = pcd_dir + "global_map.pcd";
+        if (std::filesystem::exists(default_map_path)) {
+            RCLCPP_INFO(this->get_logger(), "Found existing map at %s, attempting to load it", default_map_path.c_str());
+            bool load_success = loadMap(default_map_path);
+            if (load_success) {
+                RCLCPP_INFO(this->get_logger(), "Map loaded successfully, enabling relocalization mode");
+                // Enable relocalization automatically when map is loaded
+                relocalization_mode = true;
+                
+                // In relocalization mode, we don't set the initial pose here
+                // The system will automatically determine the position using scan context
+                // when enough measurements have been received to perform place recognition
+                RCLCPP_INFO(this->get_logger(), "Automatic relocalization will be performed using scan context when enough measurements are received");
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Failed to load map, continuing without relocalization");
+            }
+        }
+
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
 
         if (relocalization_mode) {
-            RCLCPP_INFO(this->get_logger(), "Starting in re-localization mode with initial pose");
-            
-            // Initialize state with provided initial pose
-            if (initial_pose.size() >= 7) {
-                state_point.pos = V3D(initial_pose[0], initial_pose[1], initial_pose[2]);
-                Eigen::Quaterniond q(initial_pose[3], initial_pose[4], initial_pose[5], initial_pose[6]);
-                state_point.rot = q.normalized();
-                
-                RCLCPP_INFO(this->get_logger(), "Setting initial pose to: [%.2f, %.2f, %.2f] [%.2f, %.2f, %.2f, %.2f]",
-                            state_point.pos[0], state_point.pos[1], state_point.pos[2],
-                            q.w(), q.x(), q.y(), q.z());
-            } else {
-                RCLCPP_WARN(this->get_logger(), "Invalid initial_pose parameter, using default initialization");
-            }
+            RCLCPP_INFO(this->get_logger(), "Starting in re-localization mode");
+            // The initial pose will be determined through scan context matching
+            // The first few scans will be used to generate a scan context descriptor
+            // which will be matched against the map to find the initial position
         }
 
         // Adjust downsampling parameters
@@ -1069,6 +1081,40 @@ public:
         
         // Insert loaded points into ikd-tree
         ikdtree.Build(loaded_map->points);
+        
+        // For scan context-based relocalization, create a keyframe from the loaded map
+        // We'll use this as a reference for place recognition
+        if (!keyframes_.empty()) {
+            keyframes_.clear(); // Clear any existing keyframes
+        }
+        
+        // Downsample the map for efficient scan context generation
+        pcl::PointCloud<PointType>::Ptr downsampled_map(new pcl::PointCloud<PointType>());
+        pcl::VoxelGrid<PointType> voxel_grid;
+        voxel_grid.setLeafSize(0.5, 0.5, 0.5); // Larger leaf size for scan context
+        voxel_grid.setInputCloud(loaded_map);
+        voxel_grid.filter(*downsampled_map);
+        
+        // Create a keyframe for the map at origin
+        // The actual pose doesn't matter as much as the scan context descriptor
+        Eigen::Matrix4d map_pose = Eigen::Matrix4d::Identity();
+        
+        std::shared_ptr<KeyFrame> map_keyframe = std::make_shared<KeyFrame>(
+            0, // ID
+            0.0, // timestamp (not important for map)
+            map_pose,
+            downsampled_map
+        );
+        
+        // Generate scan context for this keyframe
+        map_keyframe->scan_context = generateScanContext(downsampled_map);
+        
+        // Add to keyframes list
+        keyframes_.push_back(map_keyframe);
+        
+        RCLCPP_INFO(this->get_logger(), "Created keyframe from map with %lu points for scan context matching",
+                   downsampled_map->size());
+        
         return true;
     }
 
@@ -1087,6 +1133,49 @@ public:
 
     void timer_callback()
     {
+        static bool relocalization_done = false;
+
+        if (relocalization_mode && !relocalization_done)
+        {
+            // If we're in relocalization mode and haven't succeeded yet, try to relocalize
+            if (imu_buffer.empty() || lidar_buffer.empty()) {
+                return;
+            }
+
+            // Process the latest data to update point clouds
+            MeasureGroup measures;
+            if (!sync_packages(measures)) {
+                return;
+            }
+            
+            if (feats_undistort->empty()) {
+                RCLCPP_WARN(get_logger(), "Features undistort empty, skipping relocalization attempt");
+                return;
+            }
+
+            // Process the IMU data to update the state
+            p_imu->Process(measures, kf, feats_undistort);
+
+            // Do feature extraction and downsampling
+            if (feats_down_body->empty()) {
+                pcl::PointCloud<PointType>::Ptr feats_down(new pcl::PointCloud<PointType>());
+                downSizeFilterSurf.setInputCloud(feats_undistort);
+                downSizeFilterSurf.filter(*feats_down_body);
+            }
+
+            // Attempt relocalization
+            if (attemptRelocalization()) {
+                RCLCPP_INFO(get_logger(), "Relocalization successful! Continuing normal operation.");
+                relocalization_done = true;
+            } else {
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "Attempting relocalization... (not enough data or no match found yet)");
+                return; // Skip the rest until we have a position
+            }
+        }
+
+        /*** Segment the map in lidar FOV ***/
+        lasermap_fov_segment();
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1102,25 +1191,15 @@ public:
             match_time = 0;
             kdtree_search_time = 0.0;
             solve_time = 0;
-            solve_const_H_time = 0;
-            svd_time   = 0;
-            t0 = omp_get_wtime();
-
+            
             p_imu->Process(Measures, kf, feats_undistort);
-            state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-
-            if (feats_undistort->empty() || (feats_undistort == NULL))
-            {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+            
+            if (feats_undistort->empty() || (feats_undistort == NULL)) {
                 return;
             }
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
-            /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
-
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
@@ -1269,16 +1348,15 @@ public:
         
         RCLCPP_INFO(this->get_logger(), "Saving global map...");
         
-        // Get current time and format as ISO date
-        auto now = std::chrono::system_clock::now();
-        auto in_time_t = std::chrono::system_clock::to_time_t(now);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
-        std::string timestamp_str = ss.str();
+        // Ensure PCD directory exists
+        std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+        if (!std::filesystem::exists(pcd_dir)) {
+            RCLCPP_INFO(this->get_logger(), "Creating PCD directory: %s", pcd_dir.c_str());
+            std::filesystem::create_directories(pcd_dir);
+        }
         
-        // Use formatted timestamp for filenames
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + "Global_Map_" + 
-                             timestamp_str + ".pcd");
+        // Fixed filename for the global map
+        string all_points_dir(pcd_dir + "global_map.pcd");
         
         pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
         
@@ -1297,9 +1375,14 @@ public:
         
         pcl::io::savePCDFileBinary(all_points_dir, *global_map);
         
-        // Save trajectory for re-localization reference
-        string trajectory_dir(string(string(ROOT_DIR) + "PCD/") + "trajectory_" + 
-                             timestamp_str + ".txt");
+        // Save trajectory for re-localization reference using timestamp to avoid overwriting
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
+        std::string timestamp_str = ss.str();
+        
+        string trajectory_dir(pcd_dir + "trajectory_" + timestamp_str + ".txt");
         ofstream trajectory_file;
         trajectory_file.open(trajectory_dir, ios::out);
         for(const auto& pose : path_record)
@@ -1509,6 +1592,92 @@ public:
         marker.points.push_back(p2);
         
         pubLoopClosureMarker_->publish(marker);
+    }
+
+    bool attemptRelocalization() {
+        if (keyframes_.size() < 2 || feats_down_size < 100) {
+            // Not enough keyframes or current scan is too sparse
+            return false;
+        }
+        
+        // Create a point cloud from the current scan
+        pcl::PointCloud<PointType>::Ptr current_cloud(new pcl::PointCloud<PointType>());
+        *current_cloud = *feats_down_body;
+        
+        // Generate scan context for current scan
+        Eigen::MatrixXd current_sc = generateScanContext(current_cloud);
+        
+        // The first keyframe (index 0) is our map, try to match against it
+        auto map_keyframe = keyframes_[0];
+        
+        // Calculate similarity between current scan and map
+        double similarity_score = calculateContextSimilarity(current_sc, map_keyframe->scan_context);
+        
+        // Only attempt ICP if the scan context similarity is good enough
+        if (similarity_score > SC_DIST_THRES) {
+            RCLCPP_INFO(this->get_logger(), "Scan context similarity too low (%.4f > %.4f), still searching for position",
+                       similarity_score, SC_DIST_THRES);
+            return false;
+        }
+        
+        // We have a potential match, perform ICP to get the precise transform
+        double fitness_score = 0.0;
+        
+        // Initial guess is identity - we don't know where we are yet
+        Eigen::Matrix4d initial_guess = Eigen::Matrix4d::Identity();
+        
+        Eigen::Matrix4d transform = performICPMatching(
+            current_cloud,
+            map_keyframe->cloud,
+            initial_guess,
+            &fitness_score
+        );
+        
+        // Check ICP fitness score
+        if (fitness_score > LOOP_CLOSURE_FITNESS_SCORE_THRESH) {
+            RCLCPP_INFO(this->get_logger(), "Relocalization ICP failed: fitness score too high (%.4f > %.4f)",
+                       fitness_score, LOOP_CLOSURE_FITNESS_SCORE_THRESH);
+            return false;
+        }
+        
+        // We found our position! Update the state
+        // Extract rotation matrix
+        Eigen::Matrix3d rotation_matrix = transform.block<3, 3>(0, 0);
+        
+        // Convert to quaternion
+        Eigen::Quaterniond q(rotation_matrix);
+        q.normalize();
+        
+        // Extract translation
+        Eigen::Vector3d translation = transform.block<3, 1>(0, 3);
+        
+        // Update state
+        state_point.pos = V3D(translation(0), translation(1), translation(2));
+        state_point.rot = q;
+        
+        RCLCPP_INFO(this->get_logger(), "Relocalization successful! Setting position to: [%.2f, %.2f, %.2f]",
+                    translation(0), translation(1), translation(2));
+        
+        // Create a new keyframe at the found position
+        Eigen::Matrix4d current_pose = Eigen::Matrix4d::Identity();
+        current_pose.block<3, 3>(0, 0) = rotation_matrix;
+        current_pose.block<3, 1>(0, 3) = translation;
+        
+        std::shared_ptr<KeyFrame> new_keyframe = std::make_shared<KeyFrame>(
+            keyframes_.size(),
+            Measures.lidar_beg_time,
+            current_pose,
+            current_cloud
+        );
+        
+        // Generate scan context
+        new_keyframe->scan_context = current_sc;
+        
+        // Add to keyframes
+        keyframes_.push_back(new_keyframe);
+        
+        // We successfully relocalized
+        return true;
     }
 
 private:
