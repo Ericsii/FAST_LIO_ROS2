@@ -68,6 +68,7 @@
 #include <sstream>
 #include "scan_context.h"
 #include <filesystem>  // Add this include for std::filesystem
+#include <sensor_msgs/msg/laser_scan.hpp>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -167,6 +168,8 @@ rclcpp::TimerBase::SharedPtr local_map_timer_;
 PointCloudXYZI::Ptr accumulated_cloud_;
 rclcpp::Time last_local_map_time_;
 std::mutex local_map_mutex_;
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
 
 void SigHandle(int sig)
 {
@@ -1002,6 +1005,7 @@ public:
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubLaserScan_ = this->create_publisher<sensor_msgs::msg::LaserScan>("/scan", 20); // Changed to standard /scan topic
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1374,6 +1378,9 @@ public:
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            
+            // Publish laser scan for costmap usage
+            if (scan_pub_en) publish_laser_scan(feats_down_body);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1979,12 +1986,80 @@ public:
         }
     }
 
+    // Publish a laser scan for costmap usage
+    void publish_laser_scan(const pcl::PointCloud<PointType>::Ptr& cloud) {
+        if (!cloud || cloud->empty()) {
+            RCLCPP_WARN(this->get_logger(), "Empty point cloud, not publishing laser scan");
+            return;
+        }
+
+        // Create a laser scan message
+        sensor_msgs::msg::LaserScan laser_scan;
+        laser_scan.header.stamp = this->now();
+        laser_scan.header.frame_id = "camera_init"; // Match the frame used by FAST-LIO
+
+        // Set the parameters for the laser scan
+        const double angle_min = -M_PI;        // -180 degrees
+        const double angle_max = M_PI;         // 180 degrees
+        const int num_rays = 720;              // Number of rays in the scan (2 rays per degree)
+        const double angle_increment = (angle_max - angle_min) / num_rays;
+
+        // Configure laser scan
+        laser_scan.angle_min = angle_min;
+        laser_scan.angle_max = angle_max;
+        laser_scan.angle_increment = angle_increment;
+        laser_scan.time_increment = 0.0;
+        laser_scan.scan_time = 0.1;            // 10Hz scan rate
+        laser_scan.range_min = 0.3;            // Minimum range (matches blind parameter)
+        laser_scan.range_max = 100.0;          // Maximum range
+
+        // Initialize ranges to max range
+        laser_scan.ranges.resize(num_rays, laser_scan.range_max);
+        
+        // Project 3D points into 2D laser scan
+        for (const auto& point : cloud->points) {
+            // Skip invalid points (NaN or Inf values)
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+                continue;
+            }
+            
+            // Calculate the angle for this point
+            double angle = std::atan2(point.y, point.x);
+            
+            // Normalize angle to range [angle_min, angle_max]
+            while (angle < angle_min) angle += 2 * M_PI;
+            while (angle > angle_max) angle -= 2 * M_PI;
+            
+            // Calculate the range
+            double range = std::sqrt(point.x * point.x + point.y * point.y);
+            
+            // Skip points outside our desired range
+            if (range < laser_scan.range_min || range > laser_scan.range_max) {
+                continue;
+            }
+            
+            // Calculate the index in the ranges array
+            int index = static_cast<int>((angle - angle_min) / angle_increment);
+            if (index >= 0 && index < num_rays) {
+                // Only update if this point is closer than what we've seen so far
+                if (range < laser_scan.ranges[index]) {
+                    laser_scan.ranges[index] = range;
+                }
+            }
+        }
+        
+        // Publish the laser scan
+        pubLaserScan_->publish(laser_scan);
+        RCLCPP_DEBUG(this->get_logger(), "Published laser scan with %d rays", num_rays);
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr pubLaserScan_; // Added LaserScan publisher
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
