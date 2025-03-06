@@ -904,7 +904,9 @@ public:
         this->declare_parameter("pcd_save.periodic_save", false);
         this->declare_parameter("pcd_save.save_interval", 60.0);
         this->declare_parameter("mapping.suppress_warnings", false);
-
+        this->declare_parameter("mapping.max_height", 3.0);
+        this->declare_parameter("mapping.ground_level", -0.5);
+        
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -945,6 +947,8 @@ public:
         this->get_parameter_or<bool>("pcd_save.periodic_save", periodic_save, false);
         this->get_parameter_or<double>("pcd_save.save_interval", save_interval, 60.0);
         this->get_parameter_or<bool>("mapping.suppress_warnings", suppress_point_warnings, false);
+        this->get_parameter_or<double>("mapping.max_height", max_height_, 3.0);
+        this->get_parameter_or<double>("mapping.ground_level", ground_level_, -0.5);
         
         // For sequential scan TOF lidars, these warnings are expected, so suppress them by default
         if (p_pre->lidar_type == AVIA) {
@@ -1105,6 +1109,8 @@ public:
             RCLCPP_INFO(this->get_logger(), "  Detection interval: %d frames", loop_closure_detection_interval_);
             RCLCPP_INFO(this->get_logger(), "  Fitness score threshold: %.2f", loop_closure_fitness_score_threshold_);
         }
+
+        RCLCPP_INFO(this->get_logger(), "Map height filtering: min=%f, max=%f", ground_level_, max_height_);
     }
 
     ~LaserMappingNode()
@@ -1452,51 +1458,47 @@ public:
         ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
         std::string timestamp_str = ss.str();
         
-        // Use timestamped filename format for periodic saves
-        string periodic_map_path(pcd_dir + "Global_Map_" + timestamp_str + ".pcd");
+        // Get all points from ikdtree
+        PointVector ikdtree_points;
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
         
-        pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
-        
-        // Use the correct ikd-Tree API calls
-        PointVector removed_points;
-        ikdtree.acquire_removed_points(removed_points);
-        
-        // Get the current map - manually traverse to get points
-        ikdtree.flatten(ikdtree.Root_Node, global_map->points, NOT_RECORD);
-        
-        // Add the removed points back to the global map
-        global_map->insert(global_map->end(), removed_points.begin(), removed_points.end());
-        
-        RCLCPP_INFO(this->get_logger(), "Saving periodic map snapshot with %lu points to %s", 
-                   global_map->points.size(), periodic_map_path.c_str());
-        
-        pcl::io::savePCDFileBinary(periodic_map_path, *global_map);
-        
-        // Save trajectory for re-localization reference using timestamp to avoid overwriting
-        string trajectory_dir(pcd_dir + "trajectory_" + timestamp_str + ".txt");
-        ofstream trajectory_file;
-        trajectory_file.open(trajectory_dir, ios::out);
-        for(const auto& pose : path_record)
-        {
-            trajectory_file << pose.time << " " 
-                            << pose.x << " " << pose.y << " " << pose.z << " "
-                            << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << endl;
+        // Convert to PointCloudXYZI
+        PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+        global_map->points.resize(ikdtree_points.size());
+        for (size_t i = 0; i < ikdtree_points.size(); i++) {
+            global_map->points[i] = ikdtree_points[i];
         }
-        trajectory_file.close();
         
-        RCLCPP_INFO(this->get_logger(), "Periodic map snapshot and trajectory saved successfully");
+        // Filter points by height
+        PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
+        
+        // Use timestamped filename format for periodic saves
+        std::string periodic_map_path(pcd_dir + "tmp/Global_Map_" + timestamp_str + ".pcd");
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(periodic_map_path, *filtered_map);
+        
+        // Save trajectory
+        std::string trajectory_path = pcd_dir + "tmp/trajectory_" + timestamp_str + ".txt";
+        std::ofstream trajectory_file(trajectory_path);
+        
+        if (trajectory_file.is_open()) {
+            for (const auto& pose : path_record) {
+                trajectory_file << std::fixed << std::setprecision(6)
+                              << pose.time << " "
+                              << pose.x << " " << pose.y << " " << pose.z << " "
+                              << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << std::endl;
+            }
+            trajectory_file.close();
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Saved periodic map with %zu points (filtered from %zu points) to %s",
+                    filtered_map->points.size(), global_map->points.size(), periodic_map_path.c_str());
     }
 
     bool saveMapService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
                        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
     {
-        if (!pcd_save_en) {
-            response->success = false;
-            response->message = "Map saving is disabled";
-            return true;
-        }
-        
-        RCLCPP_INFO(this->get_logger(), "Saving global map via service call...");
+        RCLCPP_INFO(this->get_logger(), "Saving map to PCD file...");
         
         // Ensure PCD directory exists
         std::string pcd_dir = string(ROOT_DIR) + "PCD/";
@@ -1505,93 +1507,87 @@ public:
             std::filesystem::create_directories(pcd_dir);
         }
         
-        // Fixed filename for the global map (service call always saves to global_map.pcd)
-        string global_map_path(pcd_dir + "global_map.pcd");
-        
-        pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
-        
-        // Use the correct ikd-Tree API calls
-        PointVector removed_points;
-        ikdtree.acquire_removed_points(removed_points);
-        
-        // Get the current map - manually traverse to get points
-        ikdtree.flatten(ikdtree.Root_Node, global_map->points, NOT_RECORD);
-        
-        // Add the removed points back to the global map
-        global_map->insert(global_map->end(), removed_points.begin(), removed_points.end());
-        
-        RCLCPP_INFO(this->get_logger(), "Saving global map with %lu points to %s", 
-                   global_map->points.size(), global_map_path.c_str());
-        
-        pcl::io::savePCDFileBinary(global_map_path, *global_map);
-        
-        // Save current trajectory
+        // Generate timestamped filename
         auto now = std::chrono::system_clock::now();
         auto in_time_t = std::chrono::system_clock::to_time_t(now);
         std::stringstream ss;
         ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
         std::string timestamp_str = ss.str();
         
-        string trajectory_dir(pcd_dir + "trajectory_" + timestamp_str + ".txt");
-        ofstream trajectory_file;
-        trajectory_file.open(trajectory_dir, ios::out);
-        for(const auto& pose : path_record)
-        {
-            trajectory_file << pose.time << " " 
-                            << pose.x << " " << pose.y << " " << pose.z << " "
-                            << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << endl;
-        }
-        trajectory_file.close();
-        
-        RCLCPP_INFO(this->get_logger(), "Global map and trajectory saved successfully");
-        
-        response->success = true;
-        response->message = "Global map saved successfully to " + global_map_path;
-        return true;
-    }
-
-    void publishGlobalMap()
-    {
-        if (pubGlobalMap_->get_subscription_count() == 0)
-            return;
-        
-        pcl::PointCloud<PointType>::Ptr global_map(new pcl::PointCloud<PointType>());
-        
-        // Get all points from the tree
+        // Get all points from ikdtree
         PointVector ikdtree_points;
         ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
         
-        // Get deleted points
-        PointVector removed_points;
-        ikdtree.acquire_removed_points(removed_points);
+        // Convert to PointCloudXYZI
+        PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+        global_map->points.resize(ikdtree_points.size());
+        for (size_t i = 0; i < ikdtree_points.size(); i++) {
+            global_map->points[i] = ikdtree_points[i];
+        }
         
-        // Combine all points
-        global_map->points = ikdtree_points;
-        global_map->points.insert(global_map->points.end(), removed_points.begin(), removed_points.end());
+        // Filter points by height
+        PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
         
-        if (global_map->points.empty()) {
-            RCLCPP_WARN(this->get_logger(), "Global map is empty, not publishing");
+        // Save trajectory
+        std::string trajectory_path = pcd_dir + "tmp/trajectory_" + timestamp_str + ".txt";
+        std::ofstream trajectory_file(trajectory_path);
+        
+        if (trajectory_file.is_open()) {
+            for (const auto& pose : path_record) {
+                trajectory_file << std::fixed << std::setprecision(6)
+                               << pose.time << " "
+                               << pose.x << " " << pose.y << " " << pose.z << " "
+                               << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << std::endl;
+            }
+            trajectory_file.close();
+            RCLCPP_INFO(this->get_logger(), "Saved trajectory to %s", trajectory_path.c_str());
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Failed to open trajectory file for writing: %s", trajectory_path.c_str());
+        }
+        
+        // Save the map
+        std::string pcd_path = pcd_dir + "tmp/Global_Map_" + timestamp_str + ".pcd";
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(pcd_path, *filtered_map);
+        
+        response->success = true;
+        response->message = "Successfully saved map with " + std::to_string(filtered_map->points.size()) + 
+                          " points (filtered from " + std::to_string(global_map->points.size()) + " points) to " + pcd_path;
+        
+        RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+        return true;
+    }
+
+    void publishGlobalMap() {
+        if (pubGlobalMap_->get_subscription_count() == 0) {
             return;
         }
+
+        RCLCPP_INFO(this->get_logger(), "Publishing global map...");
+
+        // Get all points from ikdtree
+        PointVector ikdtree_points;
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
         
-        // Apply very light downsampling for visualization if the map is large
-        if (global_map->points.size() > 1000000) {
-            pcl::VoxelGrid<PointType> downSizeFilter;
-            downSizeFilter.setLeafSize(0.1, 0.1, 0.1);
-            
-            pcl::PointCloud<PointType>::Ptr filtered_map(new pcl::PointCloud<PointType>());
-            downSizeFilter.setInputCloud(global_map);
-            downSizeFilter.filter(*filtered_map);
-            global_map = filtered_map;
+        // Convert to PointCloudXYZI
+        PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+        global_map->points.resize(ikdtree_points.size());
+        for (size_t i = 0; i < ikdtree_points.size(); i++) {
+            global_map->points[i] = ikdtree_points[i];
         }
         
-        sensor_msgs::msg::PointCloud2 globalMapMsg;
-        pcl::toROSMsg(*global_map, globalMapMsg);
-        globalMapMsg.header.stamp = this->now();
-        globalMapMsg.header.frame_id = "map";
-        pubGlobalMap_->publish(globalMapMsg);
+        // Filter points by height for the output map
+        PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
         
-        RCLCPP_INFO(this->get_logger(), "Published global map with %lu points", global_map->points.size());
+        // Convert to ROS message and publish
+        sensor_msgs::msg::PointCloud2 global_map_msg;
+        pcl::toROSMsg(*filtered_map, global_map_msg);
+        global_map_msg.header.stamp = this->get_clock()->now();
+        global_map_msg.header.frame_id = "map";
+        pubGlobalMap_->publish(global_map_msg);
+        
+        RCLCPP_INFO(this->get_logger(), "Global map published with %zu points (filtered from %zu points)",
+                   filtered_map->points.size(), global_map->points.size());
     }
 
     // Add current frame as a keyframe
@@ -2053,6 +2049,23 @@ public:
         RCLCPP_DEBUG(this->get_logger(), "Published laser scan with %d rays", num_rays);
     }
 
+    // Filter points based on height thresholds for output only
+    PointCloudXYZI::Ptr filterPointsByHeight(const PointCloudXYZI::Ptr& cloud_in) {
+        PointCloudXYZI::Ptr cloud_filtered(new PointCloudXYZI());
+        
+        // Reserve memory for efficiency
+        cloud_filtered->reserve(cloud_in->size());
+        
+        // Filter points based on height (z-coordinate)
+        for (const auto& point : cloud_in->points) {
+            if (point.z >= ground_level_ && point.z <= max_height_) {
+                cloud_filtered->push_back(point);
+            }
+        }
+        
+        return cloud_filtered;
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -2074,6 +2087,10 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
 
+    // Relocalization variables
+    bool relocalization_done_ = false;
+    bool relocalization_reset_needed_ = false;
+    
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
     
@@ -2085,15 +2102,13 @@ private:
     double loop_closure_fitness_score_threshold_;
     std::vector<std::shared_ptr<KeyFrame>> keyframes_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pubLoopClosureMarker_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
-    rclcpp::TimerBase::SharedPtr local_map_timer_;
-    PointCloudXYZI::Ptr accumulated_cloud_;
-    rclcpp::Time last_local_map_time_;
-    std::mutex local_map_mutex_;
     
-    // Relocalization state tracking
-    bool relocalization_done_ = false;
-    bool relocalization_reset_needed_ = false;
+    // Parameters for height-based point filtering
+    double max_height_;
+    double ground_level_;
+    
+    // Local map publishing
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
 };
 
 int main(int argc, char** argv)

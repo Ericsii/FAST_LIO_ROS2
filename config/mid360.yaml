@@ -37,6 +37,8 @@
                             0., 0., 1.]
             relocalization_mode: false    # Set to true to enable re-localization mode
             initial_pose: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]  # x, y, z, qw, qx, qy, qz
+            max_height: 3.0               # Maximum height for filtering points in output map
+            ground_level: -0.5            # Minimum height for filtering points in output map
 
         publish:
             path_en: true                # true: publish Path
