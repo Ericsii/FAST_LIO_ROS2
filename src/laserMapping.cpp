@@ -1376,6 +1376,10 @@ public:
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();
+            
+            // Add the current scan to the local map for continuous visualization
+            accumulateLocalMap(feats_down_world);
+            
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1958,22 +1962,31 @@ public:
         rclcpp::Time current_time = this->get_clock()->now();
         double time_diff = (current_time - last_local_map_time_).seconds();
         
-        // Reset accumulated cloud if more than 5 seconds have passed (increased from 2 seconds)
-        // Only reset if we're not in relocalization mode, otherwise keep accumulating
-        if (time_diff > 5.0 && !relocalization_mode) {
-            accumulated_cloud_->clear();
+        // Reset accumulated cloud if more than 5 seconds have passed in normal mode
+        // In relocalization mode, we want to accumulate more points, so we use a different strategy
+        if (relocalization_mode) {
+            // In relocalization mode, we keep accumulating points until relocalization is done
+            // Just update the timestamp without clearing
             last_local_map_time_ = current_time;
         } else {
-            // Just update the timestamp without clearing if in relocalization mode
-            last_local_map_time_ = current_time;
+            // In normal operation mode, we want a sliding window of recent points
+            if (time_diff > 5.0) {
+                accumulated_cloud_->clear();
+                last_local_map_time_ = current_time;
+            } else {
+                // Just update the timestamp without clearing
+                last_local_map_time_ = current_time;
+            }
         }
         
         // Add transformed points to accumulated cloud
         *accumulated_cloud_ += *transformed_cloud;
         
         // Cap the number of points to prevent excessive memory usage
-        // Increased from 100,000 to 250,000 for better relocalization
-        if (accumulated_cloud_->points.size() > 250000) {
+        // Use a larger cap for relocalization mode to ensure enough points for matching
+        int max_points = relocalization_mode ? 250000 : 100000;
+        
+        if (accumulated_cloud_->points.size() > max_points) {
             // Downsample the cloud
             PointCloudXYZI::Ptr temp(new PointCloudXYZI());
             downSizeFilterSurf.setInputCloud(accumulated_cloud_);
