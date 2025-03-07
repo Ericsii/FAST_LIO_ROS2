@@ -1974,10 +1974,15 @@ public:
             return;
         }
         
-        // Downsample the local map
+        // Downsample the local map with a custom filter to avoid leaf size warnings
         PointCloudXYZI::Ptr local_map_ds(new PointCloudXYZI());
-        downSizeFilterMap.setInputCloud(local_map);
-        downSizeFilterMap.filter(*local_map_ds);
+        
+        // Use a larger leaf size for downsampling to prevent integer overflow
+        pcl::VoxelGrid<PointType> local_filter;
+        float ds_leaf_size = 0.2; // Larger leaf size to prevent overflow warnings
+        local_filter.setLeafSize(ds_leaf_size, ds_leaf_size, ds_leaf_size);
+        local_filter.setInputCloud(local_map);
+        local_filter.filter(*local_map_ds);
         
         // Publish the local map
         sensor_msgs::msg::PointCloud2 local_map_msg;
@@ -2000,11 +2005,33 @@ public:
         // Make a copy of the transformed cloud
         PointCloudXYZI::Ptr cloud_copy(new PointCloudXYZI(*transformed_cloud));
         
-        // Add to our queue with timestamp
+        // Add to our queue with timestamp for visualization
         timed_cloud_queue_.push_back(std::make_pair(current_time, cloud_copy));
         
-        // Add transformed points to accumulated cloud for relocalization
-        *accumulated_cloud_ += *transformed_cloud;
+        // Only accumulate points for relocalization if we're in relocalization mode and relocalization is not done yet
+        if (relocalization_mode && !relocalization_done_) {
+            // Add transformed points to accumulated cloud for relocalization
+            *accumulated_cloud_ += *transformed_cloud;
+            
+            // Log the accumulated point count for relocalization
+            RCLCPP_INFO(this->get_logger(), "Accumulating points for relocalization: %zu/%d", 
+                      accumulated_cloud_->points.size(), 3000);
+                      
+            // Cap the number of points for relocalization to prevent excessive memory usage
+            if (accumulated_cloud_->points.size() > 100000) {
+                // Downsample the cloud with a larger leaf size to prevent integer overflow
+                PointCloudXYZI::Ptr temp(new PointCloudXYZI());
+                pcl::VoxelGrid<PointType> temp_filter;
+                float larger_leaf_size = 0.3; // Use a larger leaf size for downsample
+                temp_filter.setLeafSize(larger_leaf_size, larger_leaf_size, larger_leaf_size);
+                temp_filter.setInputCloud(accumulated_cloud_);
+                temp_filter.filter(*temp);
+                accumulated_cloud_ = temp;
+                
+                RCLCPP_INFO(this->get_logger(), "Downsampled accumulated cloud to %zu points with leaf size %.2f", 
+                          accumulated_cloud_->points.size(), larger_leaf_size);
+            }
+        }
         
         // Update last map time
         last_local_map_time_ = current_time;
@@ -2029,23 +2056,8 @@ public:
         
         // Log clouds kept and removed
         if (removed_clouds > 0) {
-            RCLCPP_DEBUG(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
+            RCLCPP_INFO(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
                       timed_cloud_queue_.size(), time_window, removed_clouds);
-        }
-        
-        // For relocalization mode, log the accumulated point count
-        if (relocalization_mode) {
-            RCLCPP_INFO(this->get_logger(), "Accumulating points for relocalization: %zu/%d", 
-                       accumulated_cloud_->points.size(), 3000);
-                       
-            // Cap the number of points for relocalization to prevent excessive memory usage
-            if (accumulated_cloud_->points.size() > 250000) {
-                // Downsample the cloud
-                PointCloudXYZI::Ptr temp(new PointCloudXYZI());
-                downSizeFilterSurf.setInputCloud(accumulated_cloud_);
-                downSizeFilterSurf.filter(*temp);
-                accumulated_cloud_ = temp;
-            }
         }
     }
 
