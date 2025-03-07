@@ -168,6 +168,7 @@ rclcpp::TimerBase::SharedPtr local_map_timer_;
 PointCloudXYZI::Ptr accumulated_cloud_;
 rclcpp::Time last_local_map_time_;
 std::mutex local_map_mutex_;
+std::deque<std::pair<rclcpp::Time, PointCloudXYZI::Ptr>> timed_cloud_queue_; // Queue to store clouds with timestamps
 
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
 
@@ -1038,13 +1039,14 @@ public:
         // Initialize local map accumulation
         accumulated_cloud_.reset(new PointCloudXYZI());
         last_local_map_time_ = this->get_clock()->now();
+        timed_cloud_queue_.clear(); // Initialize the timed cloud queue
         
         // Create publisher for local map
         pubLocalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/local_map", 1);
         
-        // Create timer for local map publishing (1Hz)
+        // Create timer for local map publishing (10Hz)
         local_map_timer_ = this->create_wall_timer(
-            std::chrono::seconds(1), 
+            std::chrono::milliseconds(100), 
             std::bind(&LaserMappingNode::publishLocalMap, this));
         
         // After node initialization and parameter loading, before RCLCPP_INFO about node init finished
@@ -1228,6 +1230,7 @@ public:
                     
                     // Clear the accumulated cloud now that relocalization succeeded
                     accumulated_cloud_->clear();
+                    timed_cloud_queue_.clear(); // Also clear the timed cloud queue
                     RCLCPP_INFO(this->get_logger(), "Relocalization completed successfully. System state and map have been reset to the new position.");
                     
                     // Force a reset of the lidar_buffer and imu_buffer to avoid using outdated measurements
@@ -1932,12 +1935,44 @@ public:
     void publishLocalMap() {
         std::lock_guard<std::mutex> lock(local_map_mutex_);
         
-        if (accumulated_cloud_->points.empty()) {
+        if (timed_cloud_queue_.empty()) {
+            RCLCPP_DEBUG(this->get_logger(), "No points to publish in local map");
             return;
         }
         
-        // Create a copy of the accumulated cloud
-        PointCloudXYZI::Ptr local_map(new PointCloudXYZI(*accumulated_cloud_));
+        // Create a fresh point cloud for the local map
+        PointCloudXYZI::Ptr local_map(new PointCloudXYZI());
+        
+        // Add points from timed_cloud_queue_ with enhanced intensity based on recency
+        for (size_t i = 0; i < timed_cloud_queue_.size(); i++) {
+            // Calculate how recent this cloud is (0.0 = oldest, 1.0 = newest)
+            double recency = static_cast<double>(i) / static_cast<double>(timed_cloud_queue_.size());
+            
+            // Get the points from this cloud
+            const PointCloudXYZI::Ptr& cloud = timed_cloud_queue_[i].second;
+            
+            // Add these points to the local map with enhanced intensity based on recency
+            for (const auto& point : cloud->points) {
+                PointType new_point = point;
+                
+                // Scale intensity by recency (newer points are brighter)
+                // Adjust these values to control the visual effect
+                double time_factor = recency * 0.5 + 0.5; // ranges from 0.5 to 1.0
+                new_point.intensity *= time_factor;
+                
+                local_map->points.push_back(new_point);
+            }
+        }
+        
+        // Ensure the width/height are set correctly for the point cloud
+        local_map->width = local_map->points.size();
+        local_map->height = 1;
+        
+        // Skip publishing if we have no points
+        if (local_map->points.empty()) {
+            RCLCPP_DEBUG(this->get_logger(), "No points to publish in local map after processing");
+            return;
+        }
         
         // Downsample the local map
         PointCloudXYZI::Ptr local_map_ds(new PointCloudXYZI());
@@ -1951,47 +1986,48 @@ public:
         local_map_msg.header.frame_id = "camera_init";
         pubLocalMap_->publish(local_map_msg);
         
-        RCLCPP_DEBUG(this->get_logger(), "Published local map with %lu points", local_map_ds->points.size());
+        RCLCPP_INFO(this->get_logger(), "Published local map with %lu points from %lu clouds", 
+                   local_map_ds->points.size(), timed_cloud_queue_.size());
     }
     
     // Add a method to accumulate points for the local map
     void accumulateLocalMap(const PointCloudXYZI::Ptr& transformed_cloud) {
         std::lock_guard<std::mutex> lock(local_map_mutex_);
         
-        // Calculate time difference
+        // Get current time
         rclcpp::Time current_time = this->get_clock()->now();
-        double time_diff = (current_time - last_local_map_time_).seconds();
         
-        // Reset accumulated cloud if more than 5 seconds have passed in normal mode
-        // In relocalization mode, we want to accumulate more points, so we use a different strategy
-        if (relocalization_mode) {
-            // In relocalization mode, we keep accumulating points until relocalization is done
-            // Just update the timestamp without clearing
-            last_local_map_time_ = current_time;
-        } else {
-            // In normal operation mode, we want a sliding window of recent points
-            if (time_diff > 5.0) {
-                accumulated_cloud_->clear();
-                last_local_map_time_ = current_time;
+        // Make a copy of the transformed cloud to preserve original intensity values
+        PointCloudXYZI::Ptr cloud_copy(new PointCloudXYZI(*transformed_cloud));
+        
+        // Add to our queue with timestamp
+        timed_cloud_queue_.push_back(std::make_pair(current_time, cloud_copy));
+        
+        // Update last map time
+        last_local_map_time_ = current_time;
+        
+        // In normal operation, use a shorter time window to show more dynamic changes
+        // In relocalization mode, use a longer window for better matching
+        double time_window = relocalization_mode ? 30.0 : 2.0; // seconds
+        
+        // Remove older clouds from the queue
+        int removed_clouds = 0;
+        while (!timed_cloud_queue_.empty()) {
+            auto& oldest = timed_cloud_queue_.front();
+            double age = (current_time - oldest.first).seconds();
+            
+            if (age > time_window) {
+                timed_cloud_queue_.pop_front(); // Remove the oldest cloud
+                removed_clouds++;
             } else {
-                // Just update the timestamp without clearing
-                last_local_map_time_ = current_time;
+                break; // Stop once we find a cloud that's within our time window
             }
         }
         
-        // Add transformed points to accumulated cloud
-        *accumulated_cloud_ += *transformed_cloud;
-        
-        // Cap the number of points to prevent excessive memory usage
-        // Use a larger cap for relocalization mode to ensure enough points for matching
-        int max_points = relocalization_mode ? 250000 : 100000;
-        
-        if (accumulated_cloud_->points.size() > max_points) {
-            // Downsample the cloud
-            PointCloudXYZI::Ptr temp(new PointCloudXYZI());
-            downSizeFilterSurf.setInputCloud(accumulated_cloud_);
-            downSizeFilterSurf.filter(*temp);
-            accumulated_cloud_ = temp;
+        // Log clouds kept and removed
+        if (removed_clouds > 0) {
+            RCLCPP_INFO(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
+                      timed_cloud_queue_.size(), time_window, removed_clouds);
         }
     }
 
@@ -2148,7 +2184,7 @@ int main(int argc, char** argv)
 
     if (runtime_pos_log)
     {
-        vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
+        vector<double> t, s_vec, s_vec2, s_vec3, s_vec5, s_vec6, s_vec7;    
         FILE *fp2;
         string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
         fp2 = fopen(log_dir.c_str(),"w");
