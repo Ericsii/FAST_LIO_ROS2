@@ -2056,7 +2056,7 @@ public:
         
         // Log clouds kept and removed
         if (removed_clouds > 0) {
-            RCLCPP_INFO(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
+            RCLCPP_DEBUG(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
                       timed_cloud_queue_.size(), time_window, removed_clouds);
         }
     }
