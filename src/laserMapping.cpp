@@ -1997,11 +1997,14 @@ public:
         // Get current time
         rclcpp::Time current_time = this->get_clock()->now();
         
-        // Make a copy of the transformed cloud to preserve original intensity values
+        // Make a copy of the transformed cloud
         PointCloudXYZI::Ptr cloud_copy(new PointCloudXYZI(*transformed_cloud));
         
         // Add to our queue with timestamp
         timed_cloud_queue_.push_back(std::make_pair(current_time, cloud_copy));
+        
+        // Add transformed points to accumulated cloud for relocalization
+        *accumulated_cloud_ += *transformed_cloud;
         
         // Update last map time
         last_local_map_time_ = current_time;
@@ -2028,6 +2031,21 @@ public:
         if (removed_clouds > 0) {
             RCLCPP_INFO(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
                       timed_cloud_queue_.size(), time_window, removed_clouds);
+        }
+        
+        // For relocalization mode, log the accumulated point count
+        if (relocalization_mode) {
+            RCLCPP_INFO(this->get_logger(), "Accumulating points for relocalization: %zu/%d", 
+                       accumulated_cloud_->points.size(), 3000);
+                       
+            // Cap the number of points for relocalization to prevent excessive memory usage
+            if (accumulated_cloud_->points.size() > 250000) {
+                // Downsample the cloud
+                PointCloudXYZI::Ptr temp(new PointCloudXYZI());
+                downSizeFilterSurf.setInputCloud(accumulated_cloud_);
+                downSizeFilterSurf.filter(*temp);
+                accumulated_cloud_ = temp;
+            }
         }
     }
 
