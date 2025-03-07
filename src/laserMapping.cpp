@@ -1986,7 +1986,7 @@ public:
         local_map_msg.header.frame_id = "camera_init";
         pubLocalMap_->publish(local_map_msg);
         
-        RCLCPP_INFO(this->get_logger(), "Published local map with %lu points from %lu clouds", 
+        RCLCPP_DEBUG(this->get_logger(), "Published local map with %lu points from %lu clouds", 
                    local_map_ds->points.size(), timed_cloud_queue_.size());
     }
     
@@ -2029,7 +2029,7 @@ public:
         
         // Log clouds kept and removed
         if (removed_clouds > 0) {
-            RCLCPP_INFO(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
+            RCLCPP_DEBUG(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
                       timed_cloud_queue_.size(), time_window, removed_clouds);
         }
         
