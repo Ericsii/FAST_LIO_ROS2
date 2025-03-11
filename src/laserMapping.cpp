@@ -477,6 +477,12 @@ void map_incremental()
     {
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+        
+        /* Skip points marked by dynamic filtering */
+        if (!point_selected_surf[i]) {
+            continue; // Skip points marked as dynamic or outside valid height range
+        }
+        
         /* decide if need add to map */
         if (!Nearest_Points[i].empty() && flg_EKF_inited)
         {
@@ -487,7 +493,7 @@ void map_incremental()
             if (points_near.size() >= 5) {
                 // Check the distance to the nearest point
                 float dist = calc_dist(feats_down_world->points[i], points_near[0]);
-                if (dist < 0.05) {  // Reduce from 0.1 to 0.05
+                if (dist < 0.05) {  // Reduced from 0.1 to 0.05
                     need_add = false;
                 }
             }
@@ -908,6 +914,12 @@ public:
         this->declare_parameter("mapping.max_height", 3.0);
         this->declare_parameter("mapping.ground_level", -0.5);
         
+        // Add parameters for dynamic object filtering
+        this->declare_parameter("mapping.filter_dynamic_objects", true);
+        this->declare_parameter("mapping.dynamic_dist_threshold", 0.5);
+        this->declare_parameter("mapping.static_point_stability", 3);
+        this->declare_parameter("mapping.grid_cell_size", 0.2);
+        
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -951,13 +963,22 @@ public:
         this->get_parameter_or<double>("mapping.max_height", max_height_, 3.0);
         this->get_parameter_or<double>("mapping.ground_level", ground_level_, -0.5);
         
+        // Get dynamic filtering parameters
+        this->get_parameter_or<bool>("mapping.filter_dynamic_objects", filter_dynamic_objects, true);
+        this->get_parameter_or<float>("mapping.dynamic_dist_threshold", dynamic_dist_threshold, 0.5);
+        this->get_parameter_or<int>("mapping.static_point_stability", static_point_stability, 3);
+        this->get_parameter_or<float>("mapping.grid_cell_size", grid_cell_size, 0.2);
+        
         // For sequential scan TOF lidars, these warnings are expected, so suppress them by default
         if (p_pre->lidar_type == AVIA) {
             RCLCPP_INFO(this->get_logger(), "Sequential scan TOF lidar detected, suppressing point filter warnings by default");
             suppress_point_warnings = true;
         }
-
+        
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        RCLCPP_INFO(this->get_logger(), "Map height filtering: min=%f, max=%f", ground_level_, max_height_);
+        RCLCPP_INFO(this->get_logger(), "Dynamic object filtering: enabled=%d, stability=%d, grid_size=%.2f", 
+                   filter_dynamic_objects, static_point_stability, grid_cell_size);
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
@@ -1378,6 +1399,15 @@ public:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
+            
+            // Initialize all points as selected before filtering
+            memset(point_selected_surf, true, sizeof(bool) * feats_down_size);
+            
+            // Filter dynamic objects from the point cloud before adding to map
+            if (filter_dynamic_objects) {
+                filterDynamicPoints();
+            }
+            
             map_incremental();
             
             // Add the current scan to the local map for continuous visualization
@@ -2145,6 +2175,162 @@ public:
         return cloud_filtered;
     }
 
+    // Helper function to compute spatial hash for a point
+    std::string computeSpatialHash(const PointType& point) {
+        // Compute grid cell indices - use a finer grid for better precision
+        int x_idx = static_cast<int>(std::floor(point.x / (grid_cell_size * 0.8)));
+        int y_idx = static_cast<int>(std::floor(point.y / (grid_cell_size * 0.8)));
+        int z_idx = static_cast<int>(std::floor(point.z / (grid_cell_size * 0.8)));
+        
+        // Create a string hash
+        return std::to_string(x_idx) + "_" + std::to_string(y_idx) + "_" + std::to_string(z_idx);
+    }
+    
+    // Check if a point is likely to be part of a dynamic object
+    bool isLikelyDynamic(const PointType& point) {
+        // Skip dynamic filtering if disabled
+        if (!filter_dynamic_objects) {
+            return false;
+        }
+        
+        // Compute spatial hash for the point
+        std::string hash = computeSpatialHash(point);
+        
+        // Get current time
+        rclcpp::Time current_time = this->get_clock()->now();
+        
+        // If we've seen this cell before, update its stability
+        if (point_tracking_map.find(hash) != point_tracking_map.end()) {
+            PointTracker& tracker = point_tracking_map[hash];
+            
+            // If the point has been seen recently, check if it's moved
+            double time_diff = (current_time - tracker.last_seen).seconds();
+            
+            // Consider points seen within 0.75 seconds (less strict than 0.5)
+            if (time_diff < 0.75) { 
+                tracker.stability_counter++;
+                // Mark as static if stability threshold is reached - less strict
+                if (tracker.stability_counter >= static_point_stability) {
+                    tracker.is_static = true;
+                }
+            } else {
+                // If not seen for a while, reduce stability less aggressively
+                tracker.stability_counter = std::max(0, tracker.stability_counter - 1); 
+                // If stability drops below threshold, it's no longer considered static
+                if (tracker.stability_counter < static_point_stability) {
+                    tracker.is_static = false;
+                }
+            }
+            
+            // Update the last seen time
+            tracker.last_seen = current_time;
+            
+            // Return whether this point is likely dynamic (not static)
+            return !tracker.is_static;
+        } else {
+            // If we've never seen this cell before, add it to the map
+            PointTracker tracker;
+            tracker.stability_counter = 1;
+            tracker.last_seen = current_time;
+            tracker.is_static = false;
+            point_tracking_map[hash] = tracker;
+            
+            // New points have a chance to be considered static sooner
+            return tracker.stability_counter < 2; // Allow points to be added after 2 observations
+        }
+    }
+    
+    // Clean up old entries in the point tracking map
+    void cleanupPointTrackingMap() {
+        // Get current time
+        rclcpp::Time current_time = this->get_clock()->now();
+        
+        // Remove entries that haven't been seen in a while
+        std::vector<std::string> keys_to_remove;
+        for (const auto& pair : point_tracking_map) {
+            double time_diff = (current_time - pair.second.last_seen).seconds();
+            if (time_diff > 8.0) { // Keep points longer in memory (increased from 5.0s)
+                keys_to_remove.push_back(pair.first);
+            }
+        }
+        
+        // Remove old entries
+        for (const auto& key : keys_to_remove) {
+            point_tracking_map.erase(key);
+        }
+        
+        // Log cleanup info if removing many entries
+        if (keys_to_remove.size() > 1000) { // Increased threshold for logging
+            RCLCPP_INFO(this->get_logger(), "Cleaned up %zu old entries from point tracking map. Current size: %zu", 
+                      keys_to_remove.size(), point_tracking_map.size());
+        }
+    }
+
+    // Filter dynamic objects from point cloud - the results are stored in the point_dynamic array
+    // Returns the number of points classified as dynamic
+    int filterDynamicPoints() {
+        // Skip if dynamic filtering is disabled
+        if (!filter_dynamic_objects) {
+            return 0;
+        }
+        
+        // Clean up the point tracking map occasionally to prevent memory leaks
+        static int cleanup_counter = 0;
+        if (++cleanup_counter >= 70) { // Clean up less frequently (every 70 calls instead of 50)
+            cleanupPointTrackingMap();
+            cleanup_counter = 0;
+        }
+        
+        int dynamic_points = 0;
+        int total_points = 0;
+        
+        // Get blind parameter from preprocessor for consistency
+        double blind_sq = p_pre->blind * p_pre->blind;
+        
+        // Process all points in the current frame
+        for (int i = 0; i < feats_down_size; i++) {
+            total_points++;
+            
+            // Explicitly filter points too close to the LiDAR (robot antennas)
+            const PointType& point_body = feats_down_body->points[i];
+            double point_range_sq = point_body.x * point_body.x + 
+                                    point_body.y * point_body.y + 
+                                    point_body.z * point_body.z;
+            
+            if (point_range_sq < blind_sq) {
+                point_selected_surf[i] = false; // Filter out points too close to LiDAR
+                dynamic_points++;
+                continue;
+            }
+            
+            // Height filtering - slightly less aggressive parameters
+            if (feats_down_world->points[i].z < ground_level_ - 0.05 || 
+                feats_down_world->points[i].z > max_height_ + 0.05) {
+                point_selected_surf[i] = false; // Mark for skipping
+                dynamic_points++;
+                continue;
+            }
+            
+            // Check if this point is likely part of a dynamic object
+            if (isLikelyDynamic(feats_down_world->points[i])) {
+                dynamic_points++;
+                
+                // Mark this point for skipping in map_incremental
+                point_selected_surf[i] = false;
+            }
+        }
+        
+        // Log less frequently
+        static int log_counter = 0;
+        if (++log_counter >= 30) {
+            RCLCPP_INFO(this->get_logger(), "Dynamic points filtered: %d/%d (%.1f%%), Map hash table size: %zu",
+                      dynamic_points, total_points, 100.0 * dynamic_points / total_points, point_tracking_map.size());
+            log_counter = 0;
+        }
+        
+        return dynamic_points;
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -2185,6 +2371,22 @@ private:
     // Parameters for height-based point filtering
     double max_height_;
     double ground_level_;
+    
+    // Parameters for dynamic object filtering
+    bool filter_dynamic_objects = true;   // Enable/disable dynamic object filtering
+    float dynamic_dist_threshold = 0.5;   // Distance threshold to consider a point part of a dynamic object (in meters)
+    int static_point_stability = 3;       // Number of consistent observations needed to consider a point static
+    
+    // Data structure to track point temporal consistency
+    struct PointTracker {
+        int stability_counter = 0;  // How many times this point has been consistently observed
+        rclcpp::Time last_seen;     // When the point was last observed
+        bool is_static = false;     // Whether the point is considered static (stable)
+    };
+    
+    // Grid-based spatial hash for efficient point tracking
+    float grid_cell_size = 0.2;     // Size of grid cells for spatial hashing (in meters)
+    std::unordered_map<std::string, PointTracker> point_tracking_map;  // Track points by spatial hash
     
     // Local map publishing
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
