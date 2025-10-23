@@ -562,6 +562,41 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     publish_count -= PUBFRAME_PERIOD;
 }
 
+void publish_frame_custom(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudCustom, 
+                         const std::string& frame_id, 
+                         bool transform_to_world = false)
+{
+    if(scan_pub_en)
+    {
+        PointCloudXYZI::Ptr laserCloudToPublish;
+        
+        if (transform_to_world)
+        {
+            // Transform points to world frame
+            PointCloudXYZI::Ptr laserCloudSource(dense_pub_en ? feats_undistort : feats_down_body);
+            int size = laserCloudSource->points.size();
+            laserCloudToPublish.reset(new PointCloudXYZI(size, 1));
+            
+            for (int i = 0; i < size; i++)
+            {
+                RGBpointBodyToWorld(&laserCloudSource->points[i], 
+                                  &laserCloudToPublish->points[i]);
+            }
+        }
+        else
+        {
+            // Use points in original lidar frame
+            laserCloudToPublish = dense_pub_en ? feats_undistort : feats_down_body;
+        }
+        
+        sensor_msgs::msg::PointCloud2 laserCloudmsg;
+        pcl::toROSMsg(*laserCloudToPublish, laserCloudmsg);
+        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+        laserCloudmsg.header.frame_id = frame_id;  // Use custom frame ID
+        pubLaserCloudCustom->publish(laserCloudmsg);
+    }
+}
+
 void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
@@ -833,6 +868,12 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        
+        // Custom frame ID parameters
+        this->declare_parameter<string>("publish.custom_frame_id", "lidar_link");
+        this->declare_parameter<string>("publish.custom_topic_name", "/cloud_custom_frame");
+        this->declare_parameter<bool>("publish.custom_transform_to_world", false);
+        this->declare_parameter<bool>("publish.custom_enable", true);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,6 +910,19 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+
+        // Get custom frame parameters
+        string custom_frame_id, custom_topic_name;
+        bool custom_transform_to_world, custom_enable;
+        this->get_parameter_or<string>("publish.custom_frame_id", custom_frame_id, "lidar_link");
+        this->get_parameter_or<string>("publish.custom_topic_name", custom_topic_name, "/cloud_custom_frame");
+        this->get_parameter_or<bool>("publish.custom_transform_to_world", custom_transform_to_world, false);
+        this->get_parameter_or<bool>("publish.custom_enable", custom_enable, true);
+
+        // Store as member variables
+        custom_frame_id_ = custom_frame_id;
+        custom_transform_to_world_ = custom_transform_to_world;
+        custom_enable_ = custom_enable;
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -933,6 +987,12 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        
+        // Create custom publisher
+        if (custom_enable_) {
+            pubLaserCloudCustom_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(custom_topic_name, 20);
+        }
+        
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -1075,6 +1135,11 @@ private:
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
+            // Publish custom frame if enabled
+            if (custom_enable_) {
+                publish_frame_custom(pubLaserCloudCustom_, custom_frame_id_, custom_transform_to_world_);
+            }
+
             /*** Debug variables ***/
             if (runtime_pos_log)
             {
@@ -1152,6 +1217,12 @@ private:
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
+
+    // Custom frame parameters
+    string custom_frame_id_;
+    bool custom_transform_to_world_;
+    bool custom_enable_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudCustom_;
 };
 
 int main(int argc, char** argv)
