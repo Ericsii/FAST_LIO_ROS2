@@ -102,6 +102,8 @@ bool    is_first_lidar = true;
 bool   publish_tf = true;
 string odom_frame = "camera_init";
 string base_frame = "body";
+vector<double> lidar_pose(3, 0.0);
+vector<double> lidar_rot(4, 0.0);
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -651,6 +653,61 @@ void save_to_pcd()
     pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
 
+/**
+ * Transform pose by given position and rotation offsets
+ * 
+ * @param[in,out] in The input pose to be transformed
+ * @param[in] pos_offset The position offset as a vector of 3 doubles [dx, dy, dz]
+ * @param[in] rot_offset The rotation offset as a quaternion vector of 4 doubles [qw, qx, qy, qz]
+ * 
+ * @example
+ * Lets say we have an outside tf tree with odom->base_link
+ * This software uses camera_init->body as its internal tf tree
+ * Let's also say we have a static lidar_link frame connected to base_link, where the lidar is located
+ * We want to transform the pose from camera_init->body to odom->lidar_link
+ * We can achieve this by applying the following offsets:
+ * - pos_offset: The translation vector from base_link to lidar_link in base_link frame
+ * - rot_offset: The rotation quaternion from base_link to lidar_link
+ * By applying these offsets using this function, we effectively transform the pose from camera_init->body to odom->lidar_link
+ * 
+ */
+template<typename T>
+void transform_pose(T& in, const std::vector<double>& pos_offset, const std::vector<double>& rot_offset)
+{
+    Eigen::Vector3d pos_in(in.pose.position.x, in.pose.position.y, in.pose.position.z);
+    Eigen::Quaterniond quat_in(
+        in.pose.orientation.w,
+        in.pose.orientation.x,
+        in.pose.orientation.y,
+        in.pose.orientation.z
+    );
+
+    Eigen::Quaterniond quat_offset(
+        rot_offset[3], // note order: w, x, y, z for Eigen ctor
+        rot_offset[0],
+        rot_offset[1],
+        rot_offset[2]
+    );
+    Eigen::Vector3d t_offset(pos_offset[0], pos_offset[1], pos_offset[2]);
+
+    Eigen::Quaterniond quat_inv = quat_offset.conjugate();
+    Eigen::Vector3d t_inv = -(quat_inv * t_offset);
+
+    // T(world->base) = T(world->lidar) * T(lidar->base)
+    Eigen::Quaterniond quat_out = quat_in * quat_inv;
+    quat_out.normalize();
+    Eigen::Vector3d pos_out = pos_in + quat_in * t_inv;
+
+    in.pose.position.x = pos_out.x();
+    in.pose.position.y = pos_out.y();
+    in.pose.position.z = pos_out.z();
+    in.pose.orientation.w = quat_out.w();
+    in.pose.orientation.x = quat_out.x();
+    in.pose.orientation.y = quat_out.y();
+    in.pose.orientation.z = quat_out.z();
+}
+
+
 template<typename T>
 void set_posestamp(T & out)
 {
@@ -670,6 +727,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = base_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+    transform_pose(odomAftMapped.pose, pos_offset, rot_offset);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
@@ -854,6 +912,8 @@ public:
         this->declare_parameter<bool>("common.publish_tf", true);
         this->declare_parameter<string>("common.odom_frame", "camera_init");
         this->declare_parameter<string>("common.base_frame", "body");
+        this->declare_parameter<vector<double>>("common.lidar_pose", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("common.lidar_rot", vector<double>{0.0, 0.0, 0.0, 0.0});
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
         this->declare_parameter<double>("filter_size_map", 0.5);
@@ -899,6 +959,8 @@ public:
         this->get_parameter_or<bool>("common.publish_tf", publish_tf, true);
         this->get_parameter_or<string>("common.odom_frame", odom_frame, "camera_init");
         this->get_parameter_or<string>("common.base_frame", base_frame, "body");
+        this->get_parameter_or<vector<double>>("common.lidar_pose", lidar_pos_vec, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("common.lidar_rot", lidar_rot_vec, vector<double>{0.0, 0.0, 0.0, 0.0});
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
         this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
