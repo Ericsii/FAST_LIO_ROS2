@@ -1,0 +1,12 @@
+ieskf:
+  enable: true
+  iter_times: 6
+  converge_thresh: 1e-4
+  weight_threshold: 0.05
+
+mapping:
+  enable_map_dedupe: true
+  map_resolution: 0.05
+
+map:
+  pcd_path: "path/to/prior_map.pcd"
