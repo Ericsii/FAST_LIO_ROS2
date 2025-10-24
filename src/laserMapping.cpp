@@ -12,7 +12,7 @@
 #include <mutex>
 #include <omp.h>
 
-#include <Eigen/Dense>s
+#include <Eigen/Dense>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 
@@ -23,9 +23,9 @@
 #include <IKFoM_toolkit/esekfom/esekfom.hpp> // esekf class
 
 // existing project includes (placeholders - keep original includes as in repo)
-#include "laserMapping.h"
-#include "misc.h"
-#include "ikd_tree.h"
+// #include "laserMapping.h"
+// #include "misc.h"
+// #include "ikd_tree.h"
 
 // Global IESKF params instance used by node
 IESKFParams ieskf_params;

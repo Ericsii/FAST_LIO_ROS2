@@ -95,12 +95,15 @@ ament_export_dependencies(rosidl_default_runtime)
 add_executable(fastlio_mapping 
   src/laserMapping.cpp 
   src/preprocess.cpp
+  src/map_localization.cpp
+  src/fastlio_mapping_node.cpp
 )
 
 target_include_directories(fastlio_mapping PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
 )
 
 target_link_libraries(fastlio_mapping 
