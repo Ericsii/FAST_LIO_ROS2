@@ -1,6 +1,6 @@
 // Existing includes...
-#include "include/ieskf_params.h"
-#include "include/ieskf_utils.h"
+#include "ieskf_params.h"
+#include "ieskf_utils.h"
 
 // Global variables
 IESKFParams ieskf_params;
