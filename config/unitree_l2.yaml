@@ -27,8 +27,8 @@
             gyr_cov: 0.5
             b_acc_cov: 0.001
             b_gyr_cov: 0.001
-            fov_degree:    360.0
-            det_range:     30.0          # Unitree L2 detection range up to 30m
+            fov_degree: 360.0
+            det_range: 30.0              # Unitree L2 detection range up to 30m
             extrinsic_est_en:  false     # true: enable the online estimation of IMU-LiDAR extrinsic
             extrinsic_T: [ -0.007698, -0.014655, 0.00667 ]  # IMU offset from LiDAR center (from Unitree docs)
             extrinsic_R: [ 1., 0., 0.,

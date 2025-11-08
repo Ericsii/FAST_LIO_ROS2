@@ -34,9 +34,9 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        body:
+        base_link:
           Value: true
-        camera_init:
+        map:
           Value: true
       Marker Scale: 1
       Name: TF
@@ -44,8 +44,8 @@ Visualization Manager:
       Show Axes: true
       Show Names: false
       Tree:
-        camera_init:
-          body:
+        map:
+          base_link:
             {}
       Update Interval: 0
       Value: true
@@ -221,7 +221,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
-    Fixed Frame: camera_init
+    Fixed Frame: map
     Frame Rate: 30
   Name: root
   Tools:
