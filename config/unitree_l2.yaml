@@ -23,8 +23,8 @@
             blind: 0.5                   # minimum detection range in meters
 
         mapping:
-            acc_cov: 0.3
-            gyr_cov: 0.3
+            acc_cov: 0.5
+            gyr_cov: 0.5
             b_acc_cov: 0.001
             b_gyr_cov: 0.001
             fov_degree:    360.0
