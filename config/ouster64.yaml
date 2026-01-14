@@ -17,7 +17,7 @@
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
             
         preprocess:
-            lidar_type: 3                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+            lidar_type: 3                # 2 Velodyne, 3 Ouster, 5 Unitree L2, 6 Hesai [1 and 4 reserved]
             scan_line: 64
             timestamp_unit: 3                 # 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
             blind: 4.0

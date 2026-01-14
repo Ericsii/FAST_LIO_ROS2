@@ -1,11 +1,12 @@
 #include "preprocess.h"
 
+#include <optional>
 #include <pcl/common/common.h>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
-Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
+Preprocess::Preprocess() : feature_enabled(0), lidar_type(VELO16), blind(0.01), point_filter_num(1)
 {
   inf_bound = 10;
   N_SCANS = 6;
@@ -44,12 +45,6 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
   point_filter_num = pfilt_num;
 }
 
-void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
-{
-  avia_handler(msg);
-  *pcl_out = pl_surf;
-}
-
 void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
 {
   switch (time_unit)
@@ -81,12 +76,12 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       velodyne_handler(msg);
       break;
 
-    case MID360:
-      mid360_handler(msg);
-      break;
-
     case UNITREE_L2:
       unitree_l2_handler(msg);
+      break;
+
+    case HESAI_JT128:
+      hesai_jt128_handler(msg);
       break;
 
     default:
@@ -94,107 +89,6 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       break;
   }
   *pcl_out = pl_surf;
-}
-
-void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg)
-{
-  pl_surf.clear();
-  pl_corn.clear();
-  pl_full.clear();
-  double t1 = omp_get_wtime();
-  int plsize = msg->point_num;
-  // cout<<"plsie: "<<plsize<<endl;
-
-  pl_corn.reserve(plsize);
-  pl_surf.reserve(plsize);
-  pl_full.resize(plsize);
-
-  for (int i = 0; i < N_SCANS; i++)
-  {
-    pl_buff[i].clear();
-    pl_buff[i].reserve(plsize);
-  }
-  uint valid_num = 0;
-
-  if (feature_enabled)
-  {
-    for (uint i = 1; i < plsize; i++)
-    {
-      if ((msg->points[i].line < N_SCANS) &&
-          ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
-      {
-        pl_full[i].x = msg->points[i].x;
-        pl_full[i].y = msg->points[i].y;
-        pl_full[i].z = msg->points[i].z;
-        pl_full[i].intensity = msg->points[i].reflectivity;
-        pl_full[i].curvature =
-            msg->points[i].offset_time / float(1000000);  // use curvature as time of each laser points
-
-        bool is_new = false;
-        if ((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7) ||
-            (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
-        {
-          pl_buff[msg->points[i].line].push_back(pl_full[i]);
-        }
-      }
-    }
-    static int count = 0;
-    static double time = 0.0;
-    count++;
-    double t0 = omp_get_wtime();
-    for (int j = 0; j < N_SCANS; j++)
-    {
-      if (pl_buff[j].size() <= 5)
-        continue;
-      pcl::PointCloud<PointType>& pl = pl_buff[j];
-      plsize = pl.size();
-      vector<orgtype>& types = typess[j];
-      types.clear();
-      types.resize(plsize);
-      plsize--;
-      for (uint i = 0; i < plsize; i++)
-      {
-        types[i].range = sqrt(pl[i].x * pl[i].x + pl[i].y * pl[i].y);
-        vx = pl[i].x - pl[i + 1].x;
-        vy = pl[i].y - pl[i + 1].y;
-        vz = pl[i].z - pl[i + 1].z;
-        types[i].dista = sqrt(vx * vx + vy * vy + vz * vz);
-      }
-      types[plsize].range = sqrt(pl[plsize].x * pl[plsize].x + pl[plsize].y * pl[plsize].y);
-      give_feature(pl, types);
-      // pl_surf += pl;
-    }
-    time += omp_get_wtime() - t0;
-    printf("Feature extraction time: %lf \n", time / count);
-  }
-  else
-  {
-    for (uint i = 1; i < plsize; i++)
-    {
-      if ((msg->points[i].line < N_SCANS) &&
-          ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
-      {
-        valid_num++;
-        if (valid_num % point_filter_num == 0)
-        {
-          pl_full[i].x = msg->points[i].x;
-          pl_full[i].y = msg->points[i].y;
-          pl_full[i].z = msg->points[i].z;
-          pl_full[i].intensity = msg->points[i].reflectivity;
-          pl_full[i].curvature = msg->points[i].offset_time /
-                                 float(1000000);  // use curvature as time of each laser points, curvature unit: ms
-
-          if(((abs(pl_full[i].x - pl_full[i-1].x) > 1e-7)
-              || (abs(pl_full[i].y - pl_full[i-1].y) > 1e-7)
-              || (abs(pl_full[i].z - pl_full[i-1].z) > 1e-7))
-              && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
-          {
-            pl_surf.push_back(pl_full[i]);
-          }
-        }
-      }
-    }
-  }
 }
 
 void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
@@ -477,89 +371,6 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   }
 }
 
-void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
-{
-  pl_surf.clear();
-  pl_corn.clear();
-  pl_full.clear();
-
-  pcl::PointCloud<livox_ros::LivoxPointXyzitl> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
-  if (plsize == 0)
-    return;
-  pl_surf.reserve(plsize);
-
-  /*** These variables only works when no point timestamps given ***/
-  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
-  std::vector<bool> is_first(N_SCANS, true);
-  std::vector<double> yaw_fp(N_SCANS, 0.0);    // yaw of first scan point
-  std::vector<float> yaw_last(N_SCANS, 0.0);   // yaw of last scan point
-  std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
-  /*****************************************************************/
-
-  given_offset_time = false;
-  double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
-  double yaw_end = yaw_first;
-  int layer_first = pl_orig.points[0].line;
-  for (uint i = plsize - 1; i > 0; i--)
-  {
-    if (pl_orig.points[i].line == layer_first)
-    {
-      yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
-      break;
-    }
-  }
-
-  for (uint i = 0; i < plsize; ++i)
-  {
-    PointType added_pt;
-    added_pt.normal_x = 0;
-    added_pt.normal_y = 0;
-    added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = 0.;
-
-    int layer = pl_orig.points[i].line;
-    double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
-
-    if (is_first[layer])
-    {
-      // printf("layer: %d; is first: %d", layer, is_first[layer]);
-      yaw_fp[layer] = yaw_angle;
-      is_first[layer] = false;
-      added_pt.curvature = 0.0;
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
-      continue;
-    }
-
-    // compute offset time
-    if (yaw_angle <= yaw_fp[layer])
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-    }
-    else
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
-    }
-
-    if (added_pt.curvature < time_last[layer])
-      added_pt.curvature += 360.0 / omega_l;
-
-    yaw_last[layer] = yaw_angle;
-    time_last[layer] = added_pt.curvature;
-
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
-    {
-      pl_surf.push_back(std::move(added_pt));
-    }
-  }
-}
-
 void Preprocess::unitree_l2_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
 {
   pl_surf.clear();
@@ -682,6 +493,319 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
+    }
+  }
+}
+
+static inline bool has_field(const sensor_msgs::msg::PointCloud2 &msg, const std::string &name)
+{
+  for (const auto &f : msg.fields)
+  {
+    if (f.name == name)
+      return true;
+  }
+  return false;
+}
+
+// Hesai JT128 (PointCloud2) handler:
+// - Does NOT require field name "time" (accepts time/t/timestamp; otherwise estimates).
+// - Stores per-point relative time (ms) in PointType.curvature for IMU undistortion.
+void Preprocess::hesai_jt128_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  const auto &m = *msg;
+  const size_t N = static_cast<size_t>(m.width) * static_cast<size_t>(m.height);
+  if (N == 0)
+    return;
+
+  pl_surf.reserve(N);
+
+  const bool has_intensity = has_field(m, "intensity");
+  const bool has_ring = has_field(m, "ring");
+
+  // time field candidates (Hesai drivers often publish "timestamp" or "t")
+  const bool has_time = has_field(m, "time");
+  const bool has_t = has_field(m, "t");
+  const bool has_timestamp = has_field(m, "timestamp");
+
+  const bool has_any_time = has_time || has_t || has_timestamp;
+
+  // Fallback scan period estimate (ms) used only if we cannot rely on per-point timestamps.
+  const double scan_period_ms = (SCAN_RATE > 0) ? (1000.0 / static_cast<double>(SCAN_RATE)) : 100.0;
+
+  sensor_msgs::PointCloud2ConstIterator<float> it_x(m, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> it_y(m, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> it_z(m, "z");
+
+  std::optional<sensor_msgs::PointCloud2ConstIterator<float>> it_intensity;
+  if (has_intensity)
+    it_intensity.emplace(m, "intensity");
+
+  // ring can be uint16 or uint8 depending on driver; try uint16 first then uint8.
+  std::optional<sensor_msgs::PointCloud2ConstIterator<uint16_t>> it_ring_u16;
+  std::optional<sensor_msgs::PointCloud2ConstIterator<uint8_t>> it_ring_u8;
+  if (has_ring)
+  {
+    try
+    {
+      it_ring_u16.emplace(m, "ring");
+    }
+    catch (const std::runtime_error &)
+    {
+      it_ring_u8.emplace(m, "ring");
+    }
+  }
+
+  // time can be float or integer; we only use it to form a RELATIVE offset to the first point.
+  // We interpret the unit using preprocess.timestamp_unit via time_unit_scale (converted to ms).
+  enum class TimeIterKind
+  {
+    NONE,
+    FLOAT32,
+    FLOAT64,
+    UINT32,
+    UINT64
+  };
+
+  TimeIterKind time_kind = TimeIterKind::NONE;
+  std::string time_field;
+  if (has_time)
+    time_field = "time";
+  else if (has_t)
+    time_field = "t";
+  else if (has_timestamp)
+    time_field = "timestamp";
+
+  std::optional<sensor_msgs::PointCloud2ConstIterator<float>> it_time_f32;
+  std::optional<sensor_msgs::PointCloud2ConstIterator<double>> it_time_f64;
+  std::optional<sensor_msgs::PointCloud2ConstIterator<uint32_t>> it_time_u32;
+  std::optional<sensor_msgs::PointCloud2ConstIterator<uint64_t>> it_time_u64;
+  if (has_any_time)
+  {
+    // Probe the field datatype to pick an iterator type.
+    for (const auto &f : m.fields)
+    {
+      if (f.name != time_field)
+        continue;
+      if (f.datatype == sensor_msgs::msg::PointField::FLOAT32)
+      {
+        time_kind = TimeIterKind::FLOAT32;
+        it_time_f32.emplace(m, time_field);
+      }
+      else if (f.datatype == sensor_msgs::msg::PointField::FLOAT64)
+      {
+        time_kind = TimeIterKind::FLOAT64;
+        it_time_f64.emplace(m, time_field);
+      }
+      else if (f.datatype == sensor_msgs::msg::PointField::UINT32)
+      {
+        time_kind = TimeIterKind::UINT32;
+        it_time_u32.emplace(m, time_field);
+      }
+      else if (f.datatype == sensor_msgs::msg::PointField::UINT64)
+      {
+        time_kind = TimeIterKind::UINT64;
+        it_time_u64.emplace(m, time_field);
+      }
+      else
+      {
+        // unsupported type -> treat as missing
+        time_kind = TimeIterKind::NONE;
+      }
+      break;
+    }
+  }
+
+  double t0_raw = 0.0;
+  bool t0_set = false;
+  double last_curv_ms = -1.0;
+  bool non_monotonic = false;
+
+  for (size_t i = 0; i < N; ++i, ++it_x, ++it_y, ++it_z)
+  {
+    PointType pt;
+    pt.x = *it_x;
+    pt.y = *it_y;
+    pt.z = *it_z;
+    pt.normal_x = 0;
+    pt.normal_y = 0;
+    pt.normal_z = 0;
+
+    if (it_intensity)
+    {
+      pt.intensity = **it_intensity;
+      ++(*it_intensity);
+    }
+    else
+    {
+      pt.intensity = 0.0f;
+    }
+
+    // Range filter
+    const double r2 = static_cast<double>(pt.x) * pt.x + static_cast<double>(pt.y) * pt.y + static_cast<double>(pt.z) * pt.z;
+    if (r2 < (blind * blind))
+    {
+      // advance optional iterators that weren't advanced yet
+      if (it_ring_u16) ++(*it_ring_u16);
+      if (it_ring_u8) ++(*it_ring_u8);
+      if (it_time_f32) ++(*it_time_f32);
+      if (it_time_f64) ++(*it_time_f64);
+      if (it_time_u32) ++(*it_time_u32);
+      if (it_time_u64) ++(*it_time_u64);
+      continue;
+    }
+
+    // Downsample by skipping points
+    if (point_filter_num > 1 && (i % static_cast<size_t>(point_filter_num) != 0))
+    {
+      if (it_ring_u16) ++(*it_ring_u16);
+      if (it_ring_u8) ++(*it_ring_u8);
+      if (it_time_f32) ++(*it_time_f32);
+      if (it_time_f64) ++(*it_time_f64);
+      if (it_time_u32) ++(*it_time_u32);
+      if (it_time_u64) ++(*it_time_u64);
+      continue;
+    }
+
+    int ring = 0;
+    if (it_ring_u16)
+    {
+      ring = static_cast<int>(**it_ring_u16);
+      ++(*it_ring_u16);
+    }
+    else if (it_ring_u8)
+    {
+      ring = static_cast<int>(**it_ring_u8);
+      ++(*it_ring_u8);
+    }
+    // If ring exists and is out of expected range, skip (only matters for feature extraction)
+    if (has_ring && (ring < 0 || ring >= N_SCANS))
+    {
+      if (it_time_f32) ++(*it_time_f32);
+      if (it_time_f64) ++(*it_time_f64);
+      if (it_time_u32) ++(*it_time_u32);
+      if (it_time_u64) ++(*it_time_u64);
+      continue;
+    }
+
+    double curv_ms = 0.0;
+    if (time_kind != TimeIterKind::NONE)
+    {
+      double t_raw = 0.0;
+      if (time_kind == TimeIterKind::FLOAT32)
+      {
+        t_raw = static_cast<double>(**it_time_f32);
+        ++(*it_time_f32);
+      }
+      else if (time_kind == TimeIterKind::FLOAT64)
+      {
+        t_raw = static_cast<double>(**it_time_f64);
+        ++(*it_time_f64);
+      }
+      else if (time_kind == TimeIterKind::UINT32)
+      {
+        t_raw = static_cast<double>(**it_time_u32);
+        ++(*it_time_u32);
+      }
+      else if (time_kind == TimeIterKind::UINT64)
+      {
+        t_raw = static_cast<double>(**it_time_u64);
+        ++(*it_time_u64);
+      }
+
+      if (!t0_set)
+      {
+        t0_raw = t_raw;
+        t0_set = true;
+      }
+      // Convert to relative offset, then to ms.
+      //
+      // Hesai ROS2 driver publishes per-point `timestamp` as FLOAT64 seconds (see HesaiLidar_ROS_2.0),
+      // while FAST-LIO's `preprocess.timestamp_unit` default is often US. If we applied time_unit_scale
+      // blindly we'd be off by orders of magnitude. For FLOAT64 `timestamp`, treat it as seconds.
+      if (time_field == "timestamp" && time_kind == TimeIterKind::FLOAT64)
+      {
+        curv_ms = (t_raw - t0_raw) * 1e3;  // seconds -> ms
+      }
+      else
+      {
+        curv_ms = (t_raw - t0_raw) * static_cast<double>(time_unit_scale);
+      }
+    }
+    else
+    {
+      // No usable time field -> fill later with fallback
+      curv_ms = 0.0;
+    }
+
+    pt.curvature = static_cast<float>(curv_ms);
+
+    if (time_kind != TimeIterKind::NONE)
+    {
+      if (last_curv_ms > 0.0 && curv_ms + 1e-6 < last_curv_ms)
+        non_monotonic = true;
+      last_curv_ms = curv_ms;
+    }
+
+    if (feature_enabled)
+    {
+      // Match existing feature pipeline behavior: buffer by ring then run give_feature().
+      if (ring >= 0 && ring < N_SCANS)
+      {
+        pl_buff[ring].push_back(pt);
+      }
+    }
+    else
+    {
+      pl_surf.push_back(pt);
+    }
+  }
+
+  // If feature extraction enabled, compute features per ring as in other handlers.
+  if (feature_enabled)
+  {
+    for (int i = 0; i < N_SCANS; i++)
+    {
+      PointCloudXYZI &pl = pl_buff[i];
+      int linesize = pl.size();
+      if (linesize < 2)
+        continue;
+      vector<orgtype> &types = typess[i];
+      types.clear();
+      types.resize(linesize);
+      linesize--;
+      for (int j = 0; j < linesize; j++)
+      {
+        types[j].range = sqrt(pl[j].x * pl[j].x + pl[j].y * pl[j].y);
+        vx = pl[j].x - pl[j + 1].x;
+        vy = pl[j].y - pl[j + 1].y;
+        vz = pl[j].z - pl[j + 1].z;
+        types[j].dista = vx * vx + vy * vy + vz * vz;
+      }
+      types[linesize].range = sqrt(pl[linesize].x * pl[linesize].x + pl[linesize].y * pl[linesize].y);
+      give_feature(pl, types);
+    }
+  }
+  else
+  {
+    // If time field was missing or non-monotonic, fall back to a simple scan-period based ramp (ms).
+    if (time_kind == TimeIterKind::NONE || non_monotonic)
+    {
+      const size_t M = pl_surf.size();
+      if (M >= 2)
+      {
+        for (size_t i = 0; i < M; ++i)
+        {
+          pl_surf[i].curvature = static_cast<float>((static_cast<double>(i) / static_cast<double>(M - 1)) * scan_period_ms);
+        }
+      }
+      else if (M == 1)
+      {
+        pl_surf[0].curvature = 0.0f;
+      }
     }
   }
 }
@@ -1008,7 +1132,7 @@ void Preprocess::pub_func(PointCloudXYZI& pl, const rclcpp::Time& ct)
   pl.width = pl.size();
   sensor_msgs::msg::PointCloud2 output;
   pcl::toROSMsg(pl, output);
-  output.header.frame_id = "livox";
+  output.header.frame_id = "lidar";
   output.header.stamp = ct;
 }
 
@@ -1102,7 +1226,7 @@ int Preprocess::plane_judge(const PointCloudXYZI& pl, vector<orgtype>& types, ui
     return 0;
   }
 
-  if (lidar_type == AVIA)
+  if (lidar_type == UNUSED_1)
   {
     double dismax_mid = disarr[0] / disarr[disarrsize / 2];
     double dismid_min = disarr[disarrsize / 2] / disarr[disarrsize - 2];
