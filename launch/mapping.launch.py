@@ -1,5 +1,3 @@
-"""Launch FAST-LIO mapping node with a selectable YAML config."""
-
 import os.path
 
 from ament_index_python.packages import get_package_share_directory
@@ -13,7 +11,6 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    """Create launch description."""
     package_path = get_package_share_directory('fast_lio')
     default_config_path = os.path.join(package_path, 'config')
     default_rviz_config_path = os.path.join(
@@ -34,7 +31,7 @@ def generate_launch_description():
         description='Yaml config file path'
     )
     decalre_config_file_cmd = DeclareLaunchArgument(
-        'config_file', default_value='hesai_jt128.yaml',
+        'config_file', default_value='mid360.yaml',
         description='Config file'
     )
     declare_rviz_cmd = DeclareLaunchArgument(
