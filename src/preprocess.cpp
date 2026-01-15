@@ -73,6 +73,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
 
   switch (lidar_type)
   {
+    case DEFAULT:
+      default_handler(msg);
+      break;
+
     case OUST64:
       oust64_handler(msg);
       break;
