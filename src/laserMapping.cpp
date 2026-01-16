@@ -282,21 +282,11 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    static auto logger = rclcpp::get_logger("fast_lio.mapping");
-    static rclcpp::Clock clock(RCL_ROS_TIME);
+
+    RCLCPP_INFO(this->get_logger(), "Standard PCL callback");
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
-    RCLCPP_INFO_THROTTLE(
-        logger,
-        clock,
-        5000,
-        "PointCloud2 callback: t=%.6f points=%u scan_count=%d lidar_buf=%zu imu_buf=%zu",
-        cur_time,
-        msg->width * msg->height,
-        scan_count,
-        lidar_buffer.size(),
-        imu_buffer.size());
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
@@ -322,22 +312,10 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
-    static auto logger = rclcpp::get_logger("fast_lio.mapping");
-    static rclcpp::Clock clock(RCL_ROS_TIME);
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
-    RCLCPP_INFO_THROTTLE(
-        logger,
-        clock,
-        5000,
-        "Livox callback: t=%.6f points=%u scan_count=%d lidar_buf=%zu imu_buf=%zu",
-        cur_time,
-        msg->point_num,
-        scan_count,
-        lidar_buffer.size(),
-        imu_buffer.size());
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -373,8 +351,6 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
-    static auto logger = rclcpp::get_logger("fast_lio.mapping");
-    static rclcpp::Clock clock(RCL_ROS_TIME);
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -390,16 +366,6 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     double timestamp = get_time_sec(msg->header.stamp);
 
     mtx_buffer.lock();
-
-    RCLCPP_INFO_THROTTLE(
-        logger,
-        clock,
-        5000,
-        "IMU callback: t=%.6f publish_count=%d imu_buf=%zu lidar_buf=%zu",
-        timestamp,
-        publish_count,
-        imu_buffer.size(),
-        lidar_buffer.size());
 
     if (timestamp < last_timestamp_imu)
     {
