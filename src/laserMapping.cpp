@@ -282,21 +282,12 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    //RCLCPP_INFO(rclcpp::get_logger("fast_lio.mapping"), "Standard PCL callback");
     static auto logger = rclcpp::get_logger("fast_lio.mapping");
     static rclcpp::Clock clock(RCL_ROS_TIME);
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
-    RCLCPP_INFO_THROTTLE(
-        logger,
-        clock,
-        5000,
-        "PointCloud2 callback: t=%.6f points=%u scan_count=%d lidar_buf=%zu imu_buf=%zu",
-        cur_time,
-        msg->width * msg->height,
-        scan_count,
-        lidar_buffer.size(),
-        imu_buffer.size());
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
@@ -328,16 +319,16 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
-    RCLCPP_INFO_THROTTLE(
-        logger,
-        clock,
-        5000,
-        "Livox callback: t=%.6f points=%u scan_count=%d lidar_buf=%zu imu_buf=%zu",
-        cur_time,
-        msg->point_num,
-        scan_count,
-        lidar_buffer.size(),
-        imu_buffer.size());
+    //RCLCPP_INFO_THROTTLE(
+    //    logger,
+    //    clock,
+    //    5000,
+    //    "Livox callback: t=%.6f points=%u scan_count=%d lidar_buf=%zu imu_buf=%zu",
+    //    cur_time,
+    //    msg->point_num,
+    //    scan_count,
+    //    lidar_buffer.size(),
+    //    imu_buffer.size());
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -391,15 +382,15 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     mtx_buffer.lock();
 
-    RCLCPP_INFO_THROTTLE(
-        logger,
-        clock,
-        5000,
-        "IMU callback: t=%.6f publish_count=%d imu_buf=%zu lidar_buf=%zu",
-        timestamp,
-        publish_count,
-        imu_buffer.size(),
-        lidar_buffer.size());
+    //RCLCPP_INFO_THROTTLE(
+    //    logger,
+    //    clock,
+    //    5000,
+    //    "IMU callback: t=%.6f publish_count=%d imu_buf=%zu lidar_buf=%zu",
+    //    timestamp,
+    //    publish_count,
+    //    imu_buffer.size(),
+    //    lidar_buffer.size());
 
     if (timestamp < last_timestamp_imu)
     {
@@ -594,6 +585,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = "base_link";
+    //RCLCPP_INFO(rclcpp::get_logger("fast_lio.mapping"), "Publish frame body: %d points", size);
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -1035,7 +1027,7 @@ private:
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
-                RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
+                //RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
                     ikdtree.set_downsample_param(filter_size_map_min);
@@ -1150,7 +1142,7 @@ private:
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
+        //RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
             save_to_pcd();

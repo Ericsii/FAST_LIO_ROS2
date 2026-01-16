@@ -688,6 +688,7 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
       pl_surf.push_back(std::move(added_pt));
     }
   }
+  //RCLCPP_INFO(rclcpp::get_logger("fast_lio.mapping"), "Default handler: %d points", plsize);
 }
 
 void Preprocess::give_feature(pcl::PointCloud<PointType>& pl, vector<orgtype>& types)
