@@ -129,6 +129,13 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+/*** Base link flip transformation (for upside-down LiDAR) ***/
+bool use_base_link_flip = false;
+M3D base_link_R_flip(Eye3d);  // Rotation from camera_init to base_link
+double base_link_roll = 0.0;   // Roll angle in degrees
+double base_link_pitch = 0.0;  // Pitch angle in degrees
+double base_link_yaw = 0.0;    // Yaw angle in degrees
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -187,6 +194,17 @@ void pointBodyToWorld(PointType const * const pi, PointType * const po)
     po->x = p_global(0);
     po->y = p_global(1);
     po->z = p_global(2);
+    po->intensity = pi->intensity;
+}
+
+void pointCameraInitToBaseLink(PointType const * const pi, PointType * const po)
+{
+    V3D p_camera_init(pi->x, pi->y, pi->z);
+    V3D p_base_link = base_link_R_flip * p_camera_init;
+
+    po->x = p_base_link(0);
+    po->y = p_base_link(1);
+    po->z = p_base_link(2);
     po->intensity = pi->intensity;
 }
 
@@ -590,13 +608,28 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    *pcl_wait_pub += *laserCloudWorld;
+    
+    // Transform to base_link frame if flip is enabled
+    if (use_base_link_flip)
+    {
+        PointCloudXYZI::Ptr laserCloudBaseLink(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++)
+        {
+            pointCameraInitToBaseLink(&laserCloudWorld->points[i], \
+                                     &laserCloudBaseLink->points[i]);
+        }
+        *pcl_wait_pub += *laserCloudBaseLink;
+    }
+    else
+    {
+        *pcl_wait_pub += *laserCloudWorld;
+    }
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = use_base_link_flip ? "base_link" : "camera_init";
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -833,6 +866,10 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<bool>("publish.use_base_link_flip", false);
+        this->declare_parameter<double>("publish.base_link_roll", 180.0);
+        this->declare_parameter<double>("publish.base_link_pitch", 0.0);
+        this->declare_parameter<double>("publish.base_link_yaw", 0.0);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,8 +906,34 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<bool>("publish.use_base_link_flip", use_base_link_flip, false);
+        this->get_parameter_or<double>("publish.base_link_roll", base_link_roll, 180.0);
+        this->get_parameter_or<double>("publish.base_link_pitch", base_link_pitch, 0.0);
+        this->get_parameter_or<double>("publish.base_link_yaw", base_link_yaw, 0.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        
+        // Setup base_link transformation with configurable angles
+        if (use_base_link_flip)
+        {
+            RCLCPP_INFO(this->get_logger(), "Base link transformation enabled - map will be published in base_link frame");
+            RCLCPP_INFO(this->get_logger(), "Base link angles (deg): roll=%.2f, pitch=%.2f, yaw=%.2f", 
+                        base_link_roll, base_link_pitch, base_link_yaw);
+            
+            // Convert degrees to radians
+            double roll_rad = base_link_roll * M_PI / 180.0;
+            double pitch_rad = base_link_pitch * M_PI / 180.0;
+            double yaw_rad = base_link_yaw * M_PI / 180.0;
+            
+            // Compute rotation matrix from RPY (ZYX convention)
+            double cr = cos(roll_rad), sr = sin(roll_rad);
+            double cp = cos(pitch_rad), sp = sin(pitch_rad);
+            double cy = cos(yaw_rad), sy = sin(yaw_rad);
+            
+            base_link_R_flip << cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr,
+                                sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr,
+                                  -sp,           cp*sr,           cp*cr;
+        }
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
@@ -1073,7 +1136,7 @@ private:
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            if (map_pub_en || pcd_save_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1110,6 +1173,34 @@ private:
     void map_publish_callback()
     {
         if (map_pub_en) publish_map(pubLaserCloudMap_);
+        
+        // Publish static TF: base_link -> camera_init
+        if (use_base_link_flip)
+        {
+            publish_base_link_tf();
+        }
+    }
+    
+    void publish_base_link_tf()
+    {
+        geometry_msgs::msg::TransformStamped static_tf;
+        static_tf.header.stamp = this->get_clock()->now();
+        static_tf.header.frame_id = "base_link";
+        static_tf.child_frame_id = "camera_init";
+        
+        // No translation, only rotation
+        static_tf.transform.translation.x = 0.0;
+        static_tf.transform.translation.y = 0.0;
+        static_tf.transform.translation.z = 0.0;
+        
+        // Convert rotation matrix to quaternion
+        Eigen::Quaterniond q(base_link_R_flip);
+        static_tf.transform.rotation.w = q.w();
+        static_tf.transform.rotation.x = q.x();
+        static_tf.transform.rotation.y = q.y();
+        static_tf.transform.rotation.z = q.z();
+        
+        tf_broadcaster_->sendTransform(static_tf);
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
@@ -1166,14 +1257,14 @@ int main(int argc, char** argv)
         rclcpp::shutdown();
     /**************** save map ****************/
     /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
+    /* 2. pcd save will largely influence the real-time performances **/
+    if (pcl_wait_pub->size() > 0 && pcd_save_en)
     {
         string file_name = string("scans.pcd");
         string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
         pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        pcd_writer.writeBinary(all_points_dir, *pcl_wait_pub);
     }
 
     if (runtime_pos_log)
