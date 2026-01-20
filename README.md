@@ -204,6 +204,11 @@ base_link_pitch: -7.5        # Pitch angle (degrees) from camera_init to base_li
 base_link_yaw: 0.0           # Yaw angle (degrees) from camera_init to base_link
 ```
 
+Transformation tree will become:
+```
+base_link -> camera_init -> body (where map pointcloud will be saved in base_link frame)
+```
+
 
 ## 7.Acknowledgments
 
