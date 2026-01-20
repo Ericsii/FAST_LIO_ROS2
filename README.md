@@ -194,6 +194,17 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
     <img src="doc/uav_system.png" width=57% >
 </div>
 
-## 6.Acknowledgments
+## 6.Additional Features
+Added configuration to allow different lidar mounting orientation. Can be used if the lidar mounting is not parallel to the floor, such as in unitree g1 or other similar robots.
+Modify mid360.yaml:
+```
+use_base_link_flip: true     # true: transform map to base_link frame (for upside-down LiDAR mounting) -> change to false if the lidar orientation is not parallel to the floor
+base_link_roll: 180.0        # Roll angle (degrees) from camera_init to base_link
+base_link_pitch: -7.5        # Pitch angle (degrees) from camera_init to base_link
+base_link_yaw: 0.0           # Yaw angle (degrees) from camera_init to base_link
+```
+
+
+## 7.Acknowledgments
 
 Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).
