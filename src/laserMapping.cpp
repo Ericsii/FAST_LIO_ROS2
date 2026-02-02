@@ -129,8 +129,8 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
-/*** Base link flip transformation (for upside-down LiDAR) ***/
-bool use_base_link_flip = false;
+/*** Base link transformation ***/
+bool use_base_link = false;
 M3D base_link_R_flip(Eye3d);  // Rotation from camera_init to base_link
 double base_link_roll = 0.0;   // Roll angle in degrees
 double base_link_pitch = 0.0;  // Pitch angle in degrees
@@ -609,8 +609,8 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
                             &laserCloudWorld->points[i]);
     }
     
-    // Transform to base_link frame if flip is enabled
-    if (use_base_link_flip)
+    // Transform to base_link frame if enabled
+    if (use_base_link)
     {
         PointCloudXYZI::Ptr laserCloudBaseLink(new PointCloudXYZI(size, 1));
         for (int i = 0; i < size; i++)
@@ -629,7 +629,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = use_base_link_flip ? "base_link" : "camera_init";
+    laserCloudmsg.header.frame_id = use_base_link ? "base_link" : "camera_init";
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -866,7 +866,7 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
-        this->declare_parameter<bool>("publish.use_base_link_flip", false);
+        this->declare_parameter<bool>("publish.use_base_link", false);
         this->declare_parameter<double>("publish.base_link_roll", 180.0);
         this->declare_parameter<double>("publish.base_link_pitch", 0.0);
         this->declare_parameter<double>("publish.base_link_yaw", 0.0);
@@ -906,7 +906,7 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-        this->get_parameter_or<bool>("publish.use_base_link_flip", use_base_link_flip, false);
+        this->get_parameter_or<bool>("publish.use_base_link", use_base_link, false);
         this->get_parameter_or<double>("publish.base_link_roll", base_link_roll, 180.0);
         this->get_parameter_or<double>("publish.base_link_pitch", base_link_pitch, 0.0);
         this->get_parameter_or<double>("publish.base_link_yaw", base_link_yaw, 0.0);
@@ -914,7 +914,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
         
         // Setup base_link transformation with configurable angles
-        if (use_base_link_flip)
+        if (use_base_link)
         {
             RCLCPP_INFO(this->get_logger(), "Base link transformation enabled - map will be published in base_link frame");
             RCLCPP_INFO(this->get_logger(), "Base link angles (deg): roll=%.2f, pitch=%.2f, yaw=%.2f", 
@@ -1136,7 +1136,7 @@ private:
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            if (map_pub_en || pcd_save_en) publish_map(pubLaserCloudMap_);
+            if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1175,7 +1175,7 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_);
         
         // Publish static TF: base_link -> camera_init
-        if (use_base_link_flip)
+        if (use_base_link)
         {
             publish_base_link_tf();
         }

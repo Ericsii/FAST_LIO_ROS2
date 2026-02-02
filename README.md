@@ -198,7 +198,7 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
 Added configuration to allow different lidar mounting orientation. Can be used if the lidar mounting is not parallel to the floor, such as in unitree g1 or other similar robots.
 Modify mid360.yaml:
 ```
-use_base_link_flip: true     # true: transform map to base_link frame (for upside-down LiDAR mounting) -> change to false if the lidar orientation is not parallel to the floor
+use_base_link: true          # true: transform map to base_link frame -> change to false if you want to use camera_init frame
 base_link_roll: 180.0        # Roll angle (degrees) from camera_init to base_link
 base_link_pitch: -7.5        # Pitch angle (degrees) from camera_init to base_link
 base_link_yaw: 0.0           # Yaw angle (degrees) from camera_init to base_link

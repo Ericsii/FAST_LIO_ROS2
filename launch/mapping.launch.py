@@ -30,7 +30,7 @@ def generate_launch_description():
         'config_path', default_value=default_config_path,
         description='Yaml config file path'
     )
-    decalre_config_file_cmd = DeclareLaunchArgument(
+    declare_config_file_cmd = DeclareLaunchArgument(
         'config_file', default_value='mid360.yaml',
         description='Config file'
     )
@@ -60,7 +60,7 @@ def generate_launch_description():
     ld = LaunchDescription()
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_config_path_cmd)
-    ld.add_action(decalre_config_file_cmd)
+    ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
 
