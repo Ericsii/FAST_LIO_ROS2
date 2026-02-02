@@ -194,6 +194,28 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
     <img src="doc/uav_system.png" width=57% >
 </div>
 
-## 6.Acknowledgments
+## 6.Additional Features
+Added configuration to allow different lidar mounting orientation. Can be used if the lidar mounting is not parallel to the floor, such as in unitree g1 or other similar robots. 
+
+In this model, odom frame represent the initial position of the camera, similar to camera_init frame, but are relative to the floor in real life (or any orientation that we want)
+
+Modify mid360.yaml:
+```
+use_odom: true               # true: transform map to odom frame -> change to false if you want to use camera_init frame
+odom_roll: 0.0             # Roll angle (degrees) from odom to camera_init
+odom_pitch: 0.0            # Pitch angle (degrees) from odom to camera_init
+odom_yaw: 0.0              # Yaw angle (degrees) from odom to camera_init
+odom_x: 0.0                # Translation x (meters) from odom to camera_init
+odom_y: 0.0                # Translation y (meters) from odom to camera_init
+odom_z: 0.0                # Translation z (meters) from odom to camera_init
+```
+
+Transformation tree will become:
+```
+odom -> camera_init -> body (where map pointcloud will be saved in odom frame)
+```
+
+
+## 7.Acknowledgments
 
 Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).

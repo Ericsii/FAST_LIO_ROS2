@@ -57,6 +57,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -129,6 +130,17 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+/*** Odom transformation ***/
+bool use_odom = false;
+M3D odom_R(Eye3d);  // Rotation from camera_init to odom
+V3D odom_T(Zero3d); // Translation from camera_init to odom
+double odom_roll = 0.0;   // Roll angle in degrees
+double odom_pitch = 0.0;  // Pitch angle in degrees
+double odom_yaw = 0.0;    // Yaw angle in degrees
+double odom_x = 0.0;      // Translation x in meters
+double odom_y = 0.0;      // Translation y in meters
+double odom_z = 0.0;      // Translation z in meters
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -187,6 +199,17 @@ void pointBodyToWorld(PointType const * const pi, PointType * const po)
     po->x = p_global(0);
     po->y = p_global(1);
     po->z = p_global(2);
+    po->intensity = pi->intensity;
+}
+
+void pointCameraInitToOdom(PointType const * const pi, PointType * const po)
+{
+    V3D p_camera_init(pi->x, pi->y, pi->z);
+    V3D p_odom = odom_R * p_camera_init + odom_T;
+
+    po->x = p_odom(0);
+    po->y = p_odom(1);
+    po->z = p_odom(2);
     po->intensity = pi->intensity;
 }
 
@@ -590,13 +613,28 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    *pcl_wait_pub += *laserCloudWorld;
+    
+    // Transform to odom frame if enabled
+    if (use_odom)
+    {
+        PointCloudXYZI::Ptr laserCloudOdom(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++)
+        {
+            pointCameraInitToOdom(&laserCloudWorld->points[i], \
+                                     &laserCloudOdom->points[i]);
+        }
+        *pcl_wait_pub += *laserCloudOdom;
+    }
+    else
+    {
+        *pcl_wait_pub += *laserCloudWorld;
+    }
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = use_odom ? "odom" : "camera_init";
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -833,6 +871,13 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<bool>("publish.use_odom", false);
+        this->declare_parameter<double>("publish.odom_roll", 0.0);
+        this->declare_parameter<double>("publish.odom_pitch", 0.0);
+        this->declare_parameter<double>("publish.odom_yaw", 0.0);
+        this->declare_parameter<double>("publish.odom_x", 0.0);
+        this->declare_parameter<double>("publish.odom_y", 0.0);
+        this->declare_parameter<double>("publish.odom_z", 0.0);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,8 +914,42 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<bool>("publish.use_odom", use_odom, false);
+        this->get_parameter_or<double>("publish.odom_roll", odom_roll, 0.0);
+        this->get_parameter_or<double>("publish.odom_pitch", odom_pitch, 0.0);
+        this->get_parameter_or<double>("publish.odom_yaw", odom_yaw, 0.0);
+        this->get_parameter_or<double>("publish.odom_x", odom_x, 0.0);
+        this->get_parameter_or<double>("publish.odom_y", odom_y, 0.0);
+        this->get_parameter_or<double>("publish.odom_z", odom_z, 0.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        
+        // Setup odom transformation with configurable angles
+        if (use_odom)
+        {
+            RCLCPP_INFO(this->get_logger(), "Odom transformation enabled - map will be published in odom frame");
+            RCLCPP_INFO(this->get_logger(), "Odom angles (deg): roll=%.2f, pitch=%.2f, yaw=%.2f", 
+                        odom_roll, odom_pitch, odom_yaw);
+            RCLCPP_INFO(this->get_logger(), "Odom translation (m): x=%.2f, y=%.2f, z=%.2f", 
+                        odom_x, odom_y, odom_z);
+            
+            // Set translation vector
+            odom_T << odom_x, odom_y, odom_z;
+            
+            // Convert degrees to radians
+            double roll_rad = odom_roll * M_PI / 180.0;
+            double pitch_rad = odom_pitch * M_PI / 180.0;
+            double yaw_rad = odom_yaw * M_PI / 180.0;
+            
+            // Compute rotation matrix from RPY (ZYX convention)
+            double cr = cos(roll_rad), sr = sin(roll_rad);
+            double cp = cos(pitch_rad), sp = sin(pitch_rad);
+            double cy = cos(yaw_rad), sy = sin(yaw_rad);
+            
+            odom_R << cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr,
+                                sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr,
+                                  -sp,           cp*sr,           cp*cr;
+        }
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
@@ -934,6 +1013,12 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+        
+        if (use_odom)
+        {
+            publish_odom_tf();
+        }
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1073,7 +1158,7 @@ private:
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1111,6 +1196,28 @@ private:
     {
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
+    
+    void publish_odom_tf()
+    {
+        geometry_msgs::msg::TransformStamped static_tf;
+        static_tf.header.stamp = this->get_clock()->now();
+        static_tf.header.frame_id = "odom";
+        static_tf.child_frame_id = "camera_init";
+        
+        // No translation, only rotation
+        static_tf.transform.translation.x = odom_T(0);
+        static_tf.transform.translation.y = odom_T(1);
+        static_tf.transform.translation.z = odom_T(2);
+        
+        // Convert rotation matrix to quaternion
+        Eigen::Quaterniond q(odom_R);
+        static_tf.transform.rotation.w = q.w();
+        static_tf.transform.rotation.x = q.x();
+        static_tf.transform.rotation.y = q.y();
+        static_tf.transform.rotation.z = q.z();
+        
+        static_tf_broadcaster_->sendTransform(static_tf);
+    }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
@@ -1140,6 +1247,7 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
@@ -1166,14 +1274,14 @@ int main(int argc, char** argv)
         rclcpp::shutdown();
     /**************** save map ****************/
     /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
+    /* 2. pcd save will largely influence the real-time performances **/
+    if (pcl_wait_pub->size() > 0 && pcd_save_en)
     {
         string file_name = string("scans.pcd");
         string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
         pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        pcd_writer.writeBinary(all_points_dir, *pcl_wait_pub);
     }
 
     if (runtime_pos_log)
