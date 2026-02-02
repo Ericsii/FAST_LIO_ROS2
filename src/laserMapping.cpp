@@ -129,12 +129,12 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
-/*** Base link transformation ***/
-bool use_base_link = false;
-M3D base_link_R_flip(Eye3d);  // Rotation from camera_init to base_link
-double base_link_roll = 0.0;   // Roll angle in degrees
-double base_link_pitch = 0.0;  // Pitch angle in degrees
-double base_link_yaw = 0.0;    // Yaw angle in degrees
+/*** Odom transformation ***/
+bool use_odom = false;
+M3D odom_R(Eye3d);  // Rotation from camera_init to odom
+double odom_roll = 0.0;   // Roll angle in degrees
+double odom_pitch = 0.0;  // Pitch angle in degrees
+double odom_yaw = 0.0;    // Yaw angle in degrees
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -197,14 +197,14 @@ void pointBodyToWorld(PointType const * const pi, PointType * const po)
     po->intensity = pi->intensity;
 }
 
-void pointCameraInitToBaseLink(PointType const * const pi, PointType * const po)
+void pointCameraInitToOdom(PointType const * const pi, PointType * const po)
 {
     V3D p_camera_init(pi->x, pi->y, pi->z);
-    V3D p_base_link = base_link_R_flip * p_camera_init;
+    V3D p_odom = odom_R * p_camera_init;
 
-    po->x = p_base_link(0);
-    po->y = p_base_link(1);
-    po->z = p_base_link(2);
+    po->x = p_odom(0);
+    po->y = p_odom(1);
+    po->z = p_odom(2);
     po->intensity = pi->intensity;
 }
 
@@ -609,16 +609,16 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
                             &laserCloudWorld->points[i]);
     }
     
-    // Transform to base_link frame if enabled
-    if (use_base_link)
+    // Transform to odom frame if enabled
+    if (use_odom)
     {
-        PointCloudXYZI::Ptr laserCloudBaseLink(new PointCloudXYZI(size, 1));
+        PointCloudXYZI::Ptr laserCloudOdom(new PointCloudXYZI(size, 1));
         for (int i = 0; i < size; i++)
         {
-            pointCameraInitToBaseLink(&laserCloudWorld->points[i], \
-                                     &laserCloudBaseLink->points[i]);
+            pointCameraInitToOdom(&laserCloudWorld->points[i], \
+                                     &laserCloudOdom->points[i]);
         }
-        *pcl_wait_pub += *laserCloudBaseLink;
+        *pcl_wait_pub += *laserCloudOdom;
     }
     else
     {
@@ -629,7 +629,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = use_base_link ? "base_link" : "camera_init";
+    laserCloudmsg.header.frame_id = use_odom ? "odom" : "camera_init";
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -866,10 +866,10 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
-        this->declare_parameter<bool>("publish.use_base_link", false);
-        this->declare_parameter<double>("publish.base_link_roll", 180.0);
-        this->declare_parameter<double>("publish.base_link_pitch", 0.0);
-        this->declare_parameter<double>("publish.base_link_yaw", 0.0);
+        this->declare_parameter<bool>("publish.use_odom", false);
+        this->declare_parameter<double>("publish.odom_roll", 180.0);
+        this->declare_parameter<double>("publish.odom_pitch", 0.0);
+        this->declare_parameter<double>("publish.odom_yaw", 0.0);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -906,31 +906,31 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-        this->get_parameter_or<bool>("publish.use_base_link", use_base_link, false);
-        this->get_parameter_or<double>("publish.base_link_roll", base_link_roll, 180.0);
-        this->get_parameter_or<double>("publish.base_link_pitch", base_link_pitch, 0.0);
-        this->get_parameter_or<double>("publish.base_link_yaw", base_link_yaw, 0.0);
+        this->get_parameter_or<bool>("publish.use_odom", use_odom, false);
+        this->get_parameter_or<double>("publish.odom_roll", odom_roll, 180.0);
+        this->get_parameter_or<double>("publish.odom_pitch", odom_pitch, 0.0);
+        this->get_parameter_or<double>("publish.odom_yaw", odom_yaw, 0.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
         
-        // Setup base_link transformation with configurable angles
-        if (use_base_link)
+        // Setup odom transformation with configurable angles
+        if (use_odom)
         {
-            RCLCPP_INFO(this->get_logger(), "Base link transformation enabled - map will be published in base_link frame");
-            RCLCPP_INFO(this->get_logger(), "Base link angles (deg): roll=%.2f, pitch=%.2f, yaw=%.2f", 
-                        base_link_roll, base_link_pitch, base_link_yaw);
+            RCLCPP_INFO(this->get_logger(), "Odom transformation enabled - map will be published in odom frame");
+            RCLCPP_INFO(this->get_logger(), "Odom angles (deg): roll=%.2f, pitch=%.2f, yaw=%.2f", 
+                        odom_roll, odom_pitch, odom_yaw);
             
             // Convert degrees to radians
-            double roll_rad = base_link_roll * M_PI / 180.0;
-            double pitch_rad = base_link_pitch * M_PI / 180.0;
-            double yaw_rad = base_link_yaw * M_PI / 180.0;
+            double roll_rad = odom_roll * M_PI / 180.0;
+            double pitch_rad = odom_pitch * M_PI / 180.0;
+            double yaw_rad = odom_yaw * M_PI / 180.0;
             
             // Compute rotation matrix from RPY (ZYX convention)
             double cr = cos(roll_rad), sr = sin(roll_rad);
             double cp = cos(pitch_rad), sp = sin(pitch_rad);
             double cy = cos(yaw_rad), sy = sin(yaw_rad);
             
-            base_link_R_flip << cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr,
+            odom_R << cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr,
                                 sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr,
                                   -sp,           cp*sr,           cp*cr;
         }
@@ -1174,18 +1174,18 @@ private:
     {
         if (map_pub_en) publish_map(pubLaserCloudMap_);
         
-        // Publish static TF: base_link -> camera_init
-        if (use_base_link)
+        // Publish static TF: odom -> camera_init
+        if (use_odom)
         {
-            publish_base_link_tf();
+            publish_odom_tf();
         }
     }
     
-    void publish_base_link_tf()
+    void publish_odom_tf()
     {
         geometry_msgs::msg::TransformStamped static_tf;
         static_tf.header.stamp = this->get_clock()->now();
-        static_tf.header.frame_id = "base_link";
+        static_tf.header.frame_id = "odom";
         static_tf.child_frame_id = "camera_init";
         
         // No translation, only rotation
@@ -1194,7 +1194,7 @@ private:
         static_tf.transform.translation.z = 0.0;
         
         // Convert rotation matrix to quaternion
-        Eigen::Quaterniond q(base_link_R_flip);
+        Eigen::Quaterniond q(odom_R);
         static_tf.transform.rotation.w = q.w();
         static_tf.transform.rotation.x = q.x();
         static_tf.transform.rotation.y = q.y();
