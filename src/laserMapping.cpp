@@ -133,9 +133,13 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 /*** Odom transformation ***/
 bool use_odom = false;
 M3D odom_R(Eye3d);  // Rotation from camera_init to odom
+V3D odom_T(Zero3d); // Translation from camera_init to odom
 double odom_roll = 0.0;   // Roll angle in degrees
 double odom_pitch = 0.0;  // Pitch angle in degrees
 double odom_yaw = 0.0;    // Yaw angle in degrees
+double odom_x = 0.0;      // Translation x in meters
+double odom_y = 0.0;      // Translation y in meters
+double odom_z = 0.0;      // Translation z in meters
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -201,7 +205,7 @@ void pointBodyToWorld(PointType const * const pi, PointType * const po)
 void pointCameraInitToOdom(PointType const * const pi, PointType * const po)
 {
     V3D p_camera_init(pi->x, pi->y, pi->z);
-    V3D p_odom = odom_R * p_camera_init;
+    V3D p_odom = odom_R * p_camera_init + odom_T;
 
     po->x = p_odom(0);
     po->y = p_odom(1);
@@ -868,9 +872,12 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
         this->declare_parameter<bool>("publish.use_odom", false);
-        this->declare_parameter<double>("publish.odom_roll", 180.0);
+        this->declare_parameter<double>("publish.odom_roll", 0.0);
         this->declare_parameter<double>("publish.odom_pitch", 0.0);
         this->declare_parameter<double>("publish.odom_yaw", 0.0);
+        this->declare_parameter<double>("publish.odom_x", 0.0);
+        this->declare_parameter<double>("publish.odom_y", 0.0);
+        this->declare_parameter<double>("publish.odom_z", 0.0);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -908,9 +915,12 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         this->get_parameter_or<bool>("publish.use_odom", use_odom, false);
-        this->get_parameter_or<double>("publish.odom_roll", odom_roll, 180.0);
+        this->get_parameter_or<double>("publish.odom_roll", odom_roll, 0.0);
         this->get_parameter_or<double>("publish.odom_pitch", odom_pitch, 0.0);
         this->get_parameter_or<double>("publish.odom_yaw", odom_yaw, 0.0);
+        this->get_parameter_or<double>("publish.odom_x", odom_x, 0.0);
+        this->get_parameter_or<double>("publish.odom_y", odom_y, 0.0);
+        this->get_parameter_or<double>("publish.odom_z", odom_z, 0.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
         
@@ -920,6 +930,11 @@ public:
             RCLCPP_INFO(this->get_logger(), "Odom transformation enabled - map will be published in odom frame");
             RCLCPP_INFO(this->get_logger(), "Odom angles (deg): roll=%.2f, pitch=%.2f, yaw=%.2f", 
                         odom_roll, odom_pitch, odom_yaw);
+            RCLCPP_INFO(this->get_logger(), "Odom translation (m): x=%.2f, y=%.2f, z=%.2f", 
+                        odom_x, odom_y, odom_z);
+            
+            // Set translation vector
+            odom_T << odom_x, odom_y, odom_z;
             
             // Convert degrees to radians
             double roll_rad = odom_roll * M_PI / 180.0;
@@ -1190,9 +1205,9 @@ private:
         static_tf.child_frame_id = "camera_init";
         
         // No translation, only rotation
-        static_tf.transform.translation.x = 0.0;
-        static_tf.transform.translation.y = 0.0;
-        static_tf.transform.translation.z = 0.0;
+        static_tf.transform.translation.x = odom_T(0);
+        static_tf.transform.translation.y = odom_T(1);
+        static_tf.transform.translation.z = odom_T(2);
         
         // Convert rotation matrix to quaternion
         Eigen::Quaterniond q(odom_R);

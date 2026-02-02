@@ -195,13 +195,19 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
 </div>
 
 ## 6.Additional Features
-Added configuration to allow different lidar mounting orientation. Can be used if the lidar mounting is not parallel to the floor, such as in unitree g1 or other similar robots.
+Added configuration to allow different lidar mounting orientation. Can be used if the lidar mounting is not parallel to the floor, such as in unitree g1 or other similar robots. 
+
+In this model, odom frame represent the initial position of the camera, similar to camera_init frame, but are relative to the floor in real life (or any orientation that we want)
+
 Modify mid360.yaml:
 ```
 use_odom: true               # true: transform map to odom frame -> change to false if you want to use camera_init frame
-odom_roll: 180.0             # Roll angle (degrees) from camera_init to odom
-odom_pitch: -7.5             # Pitch angle (degrees) from camera_init to odom
-odom_yaw: 0.0                # Yaw angle (degrees) from camera_init to odom
+odom_roll: 0.0             # Roll angle (degrees) from odom to camera_init
+odom_pitch: 0.0            # Pitch angle (degrees) from odom to camera_init
+odom_yaw: 0.0              # Yaw angle (degrees) from odom to camera_init
+odom_x: 0.0                # Translation x (meters) from odom to camera_init
+odom_y: 0.0                # Translation y (meters) from odom to camera_init
+odom_z: 0.0                # Translation z (meters) from odom to camera_init
 ```
 
 Transformation tree will become:

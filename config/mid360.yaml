@@ -44,9 +44,12 @@
             dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
             use_odom: true               # true: transform map to odom frame -> change to false if you want to use camera_init frame
-            odom_roll: 180.0             # Roll angle (degrees) from camera_init to odom
-            odom_pitch: -7.5             # Pitch angle (degrees) from camera_init to odom
-            odom_yaw: 0.0                # Yaw angle (degrees) from camera_init to odom
+            odom_roll: 180.0             # Roll angle (degrees) from odom to camera_init
+            odom_pitch: -7.5             # Pitch angle (degrees) from odom to camera_init
+            odom_yaw: 0.0                # Yaw angle (degrees) from odom to camera_init
+            odom_x: 0.0                  # Translation x (meters) from odom to camera_init
+            odom_y: 0.0                  # Translation y (meters) from odom to camera_init
+            odom_z: 0.0                  # Translation z (meters) from odom to camera_init
 
         pcd_save:
             pcd_save_en: true
