@@ -696,16 +696,30 @@ void publish_odometry(
     tf_odom_from_lidar_link.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
 
     // Compose the odom_from_lidar_link transform above with the lidar_link_from_base_link transform
-    // to compute the odom_from_base_link transform, which we will then publish. The
-    // lidar_link_from_base_link transform is looked up from tf.
+    // to compute the odom_from_base_link transform, which we will then publish.
     geometry_msgs::msg::TransformStamped tf_odom_from_base_link;
     geometry_msgs::msg::TransformStamped tf_lidar_link_from_base_link;
+
     if(get_lidar_from_base_link_tf(tf_lidar_link_from_base_link, tf_buffer)) {
-        tf2::doTransform(tf_odom_from_lidar_link, tf_odom_from_base_link, tf_lidar_link_from_base_link);
-        // Fill out the rest of the transform
-        tf_odom_from_base_link.header.frame_id = tf_odom_from_lidar_link.header.frame_id;
+
+        // 1. Convert geometry_msgs to tf2::Transform objects
+        tf2::Transform tf2_odom_from_lidar;
+        tf2::Transform tf2_lidar_from_base;
+
+        tf2::fromMsg(tf_odom_from_lidar_link.transform, tf2_odom_from_lidar);
+        tf2::fromMsg(tf_lidar_link_from_base_link.transform, tf2_lidar_from_base);
+
+        // 2. Compose the transforms (Order matters: Odom->Lidar * Lidar->Base = Odom->Base)
+        tf2::Transform tf2_odom_from_base = tf2_odom_from_lidar * tf2_lidar_from_base;
+
+        // 3. Convert back to geometry_msgs
+        tf_odom_from_base_link.transform = tf2::toMsg(tf2_odom_from_base);
+
+        // Fill out the rest of the transform metadata
+        tf_odom_from_base_link.header.frame_id = tf_odom_from_lidar_link.header.frame_id; // "odom"
         tf_odom_from_base_link.header.stamp = tf_odom_from_lidar_link.header.stamp;
         tf_odom_from_base_link.child_frame_id = "base_link";
+
         tf_br->sendTransform(tf_odom_from_base_link);
     }
 
