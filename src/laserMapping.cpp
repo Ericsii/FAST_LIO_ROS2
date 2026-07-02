@@ -57,6 +57,9 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -86,6 +89,10 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+// local_frame_id: local, world-fixed, gravity-aligned frame (e.g. "odom")
+// body_frame_id: body-fixed FLU frame level with the robot (e.g. "base_link")
+string local_frame_id = "odom";
+string body_frame_id = "base_link";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -139,6 +146,13 @@ nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
+
+// Flag to check whether or not we need to look up the transform.
+bool have_lidar_body_frame_tf{false};
+// Cached lidar_link_from_base_link transform
+geometry_msgs::msg::TransformStamped tf_lidar_link_from_body_frame;
+std::string lidar_link_frame_id{"lidar_frame"};
+
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
@@ -282,6 +296,9 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    // Set lidar link frame id
+    lidar_link_frame_id = msg->header.frame_id;
+
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -310,6 +327,9 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
+    // Set lidar link frame id
+    lidar_link_frame_id = msg->header.frame_id;
+
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -505,7 +525,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = local_frame_id;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -557,7 +577,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = lidar_link_frame_id;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -574,7 +594,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    laserCloudFullRes3.header.frame_id = local_frame_id;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -596,13 +616,13 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = local_frame_id;
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
     // pcl::toROSMsg(*featsFromMap, laserCloudMap);
     // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
+    // laserCloudMap.header.frame_id = "odom";
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
@@ -625,51 +645,135 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+bool get_lidar_link_from_body_frame_tf(
+    geometry_msgs::msg::TransformStamped &transform,
+    std::unique_ptr<tf2_ros::Buffer> & tf_buffer)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+    // If we have not already looked up the transform, try to look it up.
+    if (!have_lidar_body_frame_tf) {
+        try {
+            tf_lidar_link_from_body_frame = tf_buffer->lookupTransform(lidar_link_frame_id, body_frame_id, tf2::TimePointZero);
+            // If the lookup was successful, set the flag so that we don't look it up again.
+            have_lidar_body_frame_tf = true;
+        } catch (const tf2::TransformException &ex) {
+            std::cerr << "Failed to look up transform from " << body_frame_id << " to " << lidar_link_frame_id << std::endl;
+            return false;
+        }
+    }
+    // If we already had it, or if the lookup was successful, we'll set it and return success.
+    transform = tf_lidar_link_from_body_frame;
+    return true;
+}
+
+void publish_odometry(
+    const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
+    std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
+    std::unique_ptr<tf2_ros::Buffer> & tf_buffer)
+{
+    // Populate msg_body_pose with the current lidar/IMU pose in the local frame.
+    set_posestamp(msg_body_pose);
+    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);
+    msg_body_pose.header.frame_id = local_frame_id;
+
+    // Build local_frame->lidar_link transform from the current state estimate.
+    geometry_msgs::msg::TransformStamped tf_local_frame_from_lidar_link;
+    tf_local_frame_from_lidar_link.header.frame_id = local_frame_id;
+    tf_local_frame_from_lidar_link.header.stamp = msg_body_pose.header.stamp;
+    tf_local_frame_from_lidar_link.child_frame_id = lidar_link_frame_id;
+    tf_local_frame_from_lidar_link.transform.translation.x = msg_body_pose.pose.position.x;
+    tf_local_frame_from_lidar_link.transform.translation.y = msg_body_pose.pose.position.y;
+    tf_local_frame_from_lidar_link.transform.translation.z = msg_body_pose.pose.position.z;
+    tf_local_frame_from_lidar_link.transform.rotation = msg_body_pose.pose.orientation;
+
+    // Look up the static lidar_link->body_frame mount transform.
+    geometry_msgs::msg::TransformStamped tf_lidar_link_from_body_frame;
+    if (!get_lidar_link_from_body_frame_tf(tf_lidar_link_from_body_frame, tf_buffer)) {
+        static rclcpp::Clock clock(RCL_STEADY_TIME);
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fast_lio"), clock, 1000,
+            "%s -> %s TF not yet available; skipping odometry and TF publish.",
+            lidar_link_frame_id.c_str(), body_frame_id.c_str());
+        return;
+    }
+
+    // Compose: local_frame->lidar_link * lidar_link->body_frame = local_frame->body_frame
+    tf2::Transform tf2_local_frame_from_lidar_link;
+    tf2::Transform tf2_lidar_link_from_body_frame;
+    tf2::fromMsg(tf_local_frame_from_lidar_link.transform, tf2_local_frame_from_lidar_link);
+    tf2::fromMsg(tf_lidar_link_from_body_frame.transform, tf2_lidar_link_from_body_frame);
+
+    geometry_msgs::msg::TransformStamped tf_local_frame_from_body_frame;
+    tf_local_frame_from_body_frame.header.frame_id = local_frame_id;
+    tf_local_frame_from_body_frame.header.stamp = msg_body_pose.header.stamp;
+    tf_local_frame_from_body_frame.child_frame_id = body_frame_id;
+    tf_local_frame_from_body_frame.transform = tf2::toMsg(tf2_local_frame_from_lidar_link * tf2_lidar_link_from_body_frame);
+
+    tf_br->sendTransform(tf_local_frame_from_body_frame);
+
+    // Publish odometry reporting the body_frame pose in the local frame.
+    nav_msgs::msg::Odometry odom_local_frame_from_body_frame;
+    odom_local_frame_from_body_frame.header.frame_id = local_frame_id;
+    odom_local_frame_from_body_frame.header.stamp = msg_body_pose.header.stamp;
+    odom_local_frame_from_body_frame.child_frame_id = body_frame_id;
+    odom_local_frame_from_body_frame.pose.pose.position.x = tf_local_frame_from_body_frame.transform.translation.x;
+    odom_local_frame_from_body_frame.pose.pose.position.y = tf_local_frame_from_body_frame.transform.translation.y;
+    odom_local_frame_from_body_frame.pose.pose.position.z = tf_local_frame_from_body_frame.transform.translation.z;
+    odom_local_frame_from_body_frame.pose.pose.orientation = tf_local_frame_from_body_frame.transform.rotation;
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+        odom_local_frame_from_body_frame.pose.covariance[i*6 + 0] = P(k, 3);
+        odom_local_frame_from_body_frame.pose.covariance[i*6 + 1] = P(k, 4);
+        odom_local_frame_from_body_frame.pose.covariance[i*6 + 2] = P(k, 5);
+        odom_local_frame_from_body_frame.pose.covariance[i*6 + 3] = P(k, 0);
+        odom_local_frame_from_body_frame.pose.covariance[i*6 + 4] = P(k, 1);
+        odom_local_frame_from_body_frame.pose.covariance[i*6 + 5] = P(k, 2);
     }
-
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
-    trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = "body";
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+    pubOdomAftMapped->publish(odom_local_frame_from_body_frame);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
+    if (!have_lidar_body_frame_tf) {
+        static rclcpp::Clock clock(RCL_STEADY_TIME);
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fast_lio"), clock, 1000,
+            "%s -> %s TF not yet available; skipping path publish.",
+            lidar_link_frame_id.c_str(), body_frame_id.c_str());
+        return;
+    }
+
+    // Populate msg_body_pose with the current lidar/IMU pose in the local frame.
     set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);
+    msg_body_pose.header.frame_id = local_frame_id;
+
+    // Transform the lidar pose to the body_frame pose using the cached mount transform.
+    geometry_msgs::msg::Transform local_frame_from_lidar_link_tf;
+    local_frame_from_lidar_link_tf.translation.x = msg_body_pose.pose.position.x;
+    local_frame_from_lidar_link_tf.translation.y = msg_body_pose.pose.position.y;
+    local_frame_from_lidar_link_tf.translation.z = msg_body_pose.pose.position.z;
+    local_frame_from_lidar_link_tf.rotation = msg_body_pose.pose.orientation;
+
+    tf2::Transform tf2_local_frame_from_lidar_link;
+    tf2::Transform tf2_lidar_link_from_body_frame;
+    tf2::fromMsg(local_frame_from_lidar_link_tf, tf2_local_frame_from_lidar_link);
+    tf2::fromMsg(tf_lidar_link_from_body_frame.transform, tf2_lidar_link_from_body_frame);
+    geometry_msgs::msg::Transform local_frame_from_body_frame_tf = tf2::toMsg(tf2_local_frame_from_lidar_link * tf2_lidar_link_from_body_frame);
+
+    geometry_msgs::msg::PoseStamped body_pose;
+    body_pose.header.stamp = msg_body_pose.header.stamp;
+    body_pose.header.frame_id = local_frame_id;
+    body_pose.pose.position.x = local_frame_from_body_frame_tf.translation.x;
+    body_pose.pose.position.y = local_frame_from_body_frame_tf.translation.y;
+    body_pose.pose.position.z = local_frame_from_body_frame_tf.translation.z;
+    body_pose.pose.orientation = local_frame_from_body_frame_tf.rotation;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
     jjj++;
-    if (jjj % 10 == 0) 
+    if (jjj % 10 == 0)
     {
-        path.poses.push_back(msg_body_pose);
+        path.poses.push_back(body_pose);
         pubPath->publish(path);
     }
 }
@@ -833,6 +937,8 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<string>("local_frame_id", "odom");
+        this->declare_parameter<string>("body_frame_id", "base_link");
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,11 +975,13 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<string>("local_frame_id", local_frame_id, "odom");
+        this->get_parameter_or<string>("body_frame_id", body_frame_id, "base_link");
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
+        path.header.frame_id = local_frame_id;
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -934,6 +1042,8 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1061,7 +1171,7 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_, tf_buffer_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1140,6 +1250,8 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
